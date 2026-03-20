@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装Python依赖
@@ -15,11 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制代码
 COPY . .
 
-# 收集静态文件
+# 收集静态文件（忽略错误）
 RUN python manage.py collectstatic --noinput || true
 
-# 暴露端口
-EXPOSE 8000
+# 暴露端口（Railway使用PORT环境变量）
+EXPOSE 8080
 
-# 启动脚本（迁移 + 初始化 + 启动）
+# 启动脚本（迁移 + 初始化知识图谱 + 启动gunicorn）
 CMD ["bash", "startup.sh"]

@@ -21,8 +21,8 @@ else:
 # 启动 Gunicorn
 echo ">>> 启动 Gunicorn..."
 exec gunicorn config.wsgi:application \
-    --bind 0.0.0.0:${PORT:-8000} \
+    --bind 0.0.0.0:${PORT:-8080} \
     --workers 2 \
-    --timeout 120 \
+    --timeout 180 \
     --log-level info \
     --access-logfile -

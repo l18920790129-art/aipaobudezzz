@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>路线大师 · 运动智能伴侣</title>
+<script src="https://webapi.amap.com/maps?v=2.0&key=213a968a1964c78c07a2883e9590820b&plugin=AMap.Walking,AMap.Riding,AMap.Scale,AMap.ToolBar"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+:root{
+  --primary:#2563eb;--primary-dark:#1d4ed8;--primary-light:#eff6ff;
+  --success:#10b981;--warning:#f59e0b;--danger:#ef4444;
+  --bg:#f8fafc;--surface:#fff;--border:#e2e8f0;
+  --text:#1e293b;--muted:#64748b;
+  --panel:420px;
+  --topbar:52px;
+}
+html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;}
+
+/* ===== 顶部栏 ===== */
+.topbar{
+  position:fixed;top:0;left:0;right:0;z-index:300;
+  height:var(--topbar);
+  background:linear-gradient(90deg,#0f172a 0%,#1e3a5f 60%,#2563eb 100%);
+  display:flex;align-items:center;padding:0 16px;gap:10px;
+  box-shadow:0 2px 12px rgba(0,0,0,0.3);
+}
+.logo-wrap{display:flex;align-items:center;gap:8px;}
+.logo-icon{width:32px;height:32px;background:linear-gradient(135deg,#3b82f6,#7c3aed);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;}
+.logo-name{font-weight:700;font-size:15px;color:#fff;}
+.logo-sub{font-size:10px;color:rgba(255,255,255,0.55);}
+.topbar-sep{width:1px;height:20px;background:rgba(255,255,255,0.15);margin:0 4px;}
+.topbar-spacer{flex:1;}
+.tbtn{
+  padding:5px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.2);
+  background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.85);
+  font-size:12px;cursor:pointer;display:flex;align-items:center;gap:5px;
+  transition:all .15s;white-space:nowrap;
+}
+.tbtn:hover,.tbtn.active{background:rgba(255,255,255,0.2);color:#fff;border-color:rgba(255,255,255,0.4);}
+.memory-badge{
+  padding:4px 10px;border-radius:20px;
+  background:rgba(16,185,129,0.2);border:1px solid rgba(16,185,129,0.4);
+  color:#6ee7b7;font-size:11px;
+}
+
+/* ===== 主布局：左地图 + 右面板 ===== */
+.layout{
+  position:fixed;top:var(--topbar);left:0;right:0;bottom:0;
+  display:flex;
+}
+
+/* ===== 地图区域 ===== */
+.map-area{
+  flex:1;position:relative;overflow:hidden;
+  transition:margin-right .3s cubic-bezier(.4,0,.2,1);
+}
+.map-area.panel-open{margin-right:var(--panel);}
+#amap{position:absolute;inset:0;}
+
+/* 地图上的路线信息浮层 */
+.map-route-info{
+  position:absolute;bottom:0;left:0;right:0;z-index:10;
+  background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);
+  border-top:1px solid var(--border);
+  padding:10px 20px;
+  display:flex;align-items:center;gap:20px;
+  transform:translateY(100%);transition:transform .3s;
+}
+.map-route-info.show{transform:translateY(0);}
+.ri-stat .v{font-size:20px;font-weight:700;color:var(--primary);}
+.ri-stat .l{font-size:10px;color:var(--muted);}
+.ri-waypoints{flex:1;display:flex;align-items:center;flex-wrap:wrap;gap:4px;}
+.ri-wp{padding:3px 8px;background:var(--primary-light);color:var(--primary);border-radius:4px;font-size:12px;font-weight:500;}
+.ri-arrow{color:#94a3b8;font-size:12px;}
+.ri-close{margin-left:auto;background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;padding:4px;}
+
+/* 地图悬浮按钮（面板关闭时） */
+.map-fab{
+  position:absolute;bottom:80px;right:20px;z-index:10;
+  width:52px;height:52px;border-radius:50%;
+  background:linear-gradient(135deg,#2563eb,#7c3aed);
+  border:none;color:#fff;font-size:20px;cursor:pointer;
+  box-shadow:0 4px 20px rgba(37,99,235,0.45);
+  display:flex;align-items:center;justify-content:center;
+  transition:transform .2s,opacity .2s;
+}
+.map-fab:hover{transform:scale(1.08);}
+.map-fab.hidden{opacity:0;pointer-events:none;}
+.fab-badge{
+  position:absolute;top:-2px;right:-2px;
+  width:16px;height:16px;background:#ef4444;border-radius:50%;
+  color:#fff;font-size:9px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;
+  border:2px solid #fff;
+}
+
+/* ===== 右侧面板 ===== */
+.side-panel{
+  position:fixed;top:var(--topbar);right:0;bottom:0;
+  width:var(--panel);z-index:200;
+  background:#fff;
+  border-left:1px solid var(--border);
+  box-shadow:-4px 0 24px rgba(0,0,0,0.1);
+  display:flex;flex-direction:column;
+  transform:translateX(100%);
+  transition:transform .3s cubic-bezier(.4,0,.2,1);
+}
+.side-panel.open{transform:translateX(0);}
+
+/* 面板标签 */
+.panel-tabs{
+  display:flex;border-bottom:1px solid var(--border);
+  background:#f8fafc;flex-shrink:0;
+}
+.ptab{
+  flex:1;padding:11px 4px;text-align:center;font-size:12px;font-weight:600;
+  color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+  transition:all .15s;display:flex;align-items:center;justify-content:center;gap:3px;
+}
+.ptab:hover:not(.active){color:var(--text);background:#f1f5f9;}
+.ptab.active{color:var(--primary);border-bottom-color:var(--primary);background:#fff;}
+.ptab-close{
+  flex:0 0 40px;padding:11px;text-align:center;font-size:14px;
+  color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;
+  transition:all .15s;display:flex;align-items:center;justify-content:center;
+}
+.ptab-close:hover{color:var(--text);background:#f1f5f9;}
+
+/* 标签内容 */
+.tab-body{flex:1;overflow:hidden;display:flex;flex-direction:column;}
+.tab-pane{display:none;flex:1;flex-direction:column;overflow:hidden;}
+.tab-pane.active{display:flex;}
+
+/* ===== 聊天标签 ===== */
+.chat-msgs{
+  flex:1;overflow-y:auto;padding:16px;
+  display:flex;flex-direction:column;gap:12px;
+}
+.chat-msgs::-webkit-scrollbar{width:4px;}
+.chat-msgs::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:2px;}
+
+/* 欢迎屏 */
+.welcome{display:flex;flex-direction:column;align-items:center;padding:24px 16px;text-align:center;}
+.welcome-icon{font-size:44px;margin-bottom:10px;}
+.welcome-title{font-size:17px;font-weight:700;color:var(--text);margin-bottom:6px;}
+.welcome-sub{color:var(--muted);font-size:13px;line-height:1.6;max-width:280px;}
+.quick-list{margin-top:14px;width:100%;}
+.quick-item{
+  padding:8px 12px;border-radius:8px;border:1px solid var(--border);
+  background:var(--bg);color:var(--text);font-size:12px;
+  cursor:pointer;text-align:left;margin-bottom:5px;width:100%;
+  transition:all .15s;display:flex;align-items:center;gap:8px;
+}
+.quick-item:hover{background:var(--primary-light);border-color:var(--primary);color:var(--primary);}
+
+/* 消息气泡 */
+.msg-row{display:flex;animation:fadeUp .2s ease;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+.msg-row.user{flex-direction:row-reverse;}
+.avatar{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;}
+.avatar.user{background:var(--primary);color:#fff;margin-left:8px;}
+.avatar.assistant{background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;margin-right:8px;}
+.bubble-wrap{max-width:82%;display:flex;flex-direction:column;}
+.msg-row.user .bubble-wrap{align-items:flex-end;}
+.msg-row.assistant .bubble-wrap{align-items:flex-start;}
+.bubble{padding:10px 13px;border-radius:14px;font-size:13px;line-height:1.6;word-break:break-word;}
+.bubble.user{background:var(--primary);color:#fff;border-bottom-right-radius:3px;}
+.bubble.assistant{background:#f1f5f9;color:var(--text);border-bottom-left-radius:3px;}
+.bubble.assistant p{margin-bottom:5px;}.bubble.assistant p:last-child{margin-bottom:0;}
+.bubble.assistant strong{font-weight:600;color:var(--primary);}
+.bubble.assistant ul,.bubble.assistant ol{padding-left:16px;margin:3px 0;}
+.bubble.assistant li{margin-bottom:2px;}
+.msg-time{font-size:10px;color:#94a3b8;margin-top:3px;padding:0 2px;}
+
+/* 打字动画 */
+.typing{display:flex;align-items:center;gap:3px;padding:10px 13px;background:#f1f5f9;border-radius:14px;border-bottom-left-radius:3px;}
+.td{width:5px;height:5px;background:#94a3b8;border-radius:50%;animation:tdBounce 1.2s infinite;}
+.td:nth-child(2){animation-delay:.2s;}.td:nth-child(3){animation-delay:.4s;}
+@keyframes tdBounce{0%,60%,100%{transform:translateY(0);opacity:.5}30%{transform:translateY(-4px);opacity:1}}
+
+/* 路线卡片 */
+.route-card{margin-top:6px;background:#fff;border:1px solid var(--border);border-radius:10px;overflow:hidden;max-width:300px;}
+.rc-head{padding:9px 13px;background:linear-gradient(135deg,#2563eb,#7c3aed);color:#fff;display:flex;align-items:center;gap:6px;font-weight:600;font-size:13px;}
+.rc-body{padding:11px 13px;}
+.rc-stats{display:flex;gap:14px;margin-bottom:9px;}
+.rc-stat .v{font-size:17px;font-weight:700;color:var(--primary);}
+.rc-stat .l{font-size:10px;color:var(--muted);}
+.wp-list{margin-bottom:9px;}
+.wp-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text);margin-bottom:3px;}
+.wp-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.wp-dot.s{background:#10b981;}.wp-dot.m{background:#2563eb;}.wp-dot.e{background:#ef4444;}
+.rc-rec{font-size:12px;color:var(--text);line-height:1.5;padding:8px;background:#f8fafc;border-radius:6px;border-left:3px solid var(--primary);margin-bottom:8px;}
+.view-btn{width:100%;padding:7px;background:var(--primary);color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;transition:background .2s;}
+.view-btn:hover{background:var(--primary-dark);}
+
+/* RAG面板 */
+.rag-panel{margin-top:6px;padding:9px 11px;background:#fefce8;border:1px solid #fde68a;border-radius:8px;max-width:300px;}
+.rag-title{font-size:11px;font-weight:600;color:#92400e;margin-bottom:5px;display:flex;align-items:center;gap:4px;}
+.rag-item{font-size:11px;color:#78350f;margin-bottom:3px;padding-left:8px;border-left:2px solid #fbbf24;line-height:1.5;}
+
+/* Agent步骤面板 */
+.agent-panel{margin-top:6px;padding:9px 11px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;max-width:300px;}
+.agent-title{font-size:11px;font-weight:600;color:#166534;margin-bottom:5px;cursor:pointer;display:flex;align-items:center;gap:4px;}
+.agent-step{display:flex;align-items:flex-start;gap:5px;font-size:11px;color:#15803d;margin-bottom:2px;}
+.agent-step .si{color:#22c55e;flex-shrink:0;margin-top:1px;}
+
+/* 输入区 */
+.input-area{padding:11px 13px;border-top:1px solid var(--border);flex-shrink:0;background:#fff;}
+.origin-bar{display:flex;align-items:center;gap:6px;padding:6px 10px;background:#eff6ff;border-radius:8px;margin-bottom:7px;}
+.origin-bar label{font-size:12px;color:var(--primary);font-weight:500;white-space:nowrap;}
+.origin-input{flex:1;border:none;background:transparent;font-size:12px;color:var(--text);outline:none;}
+.origin-input::placeholder{color:#93c5fd;}
+.input-wrap{display:flex;align-items:flex-end;gap:7px;background:var(--bg);border:1.5px solid var(--border);border-radius:12px;padding:7px 11px;transition:border-color .2s;}
+.input-wrap:focus-within{border-color:var(--primary);}
+.input-ta{flex:1;border:none;background:transparent;resize:none;font-size:13px;line-height:1.5;color:var(--text);max-height:90px;outline:none;font-family:inherit;}
+.input-ta::placeholder{color:#94a3b8;}
+.send-btn{width:30px;height:30px;background:var(--primary);border:none;border-radius:7px;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;transition:all .15s;}
+.send-btn:hover{background:var(--primary-dark);}
+.send-btn:disabled{background:#cbd5e1;cursor:not-allowed;}
+.input-hint{font-size:10px;color:#94a3b8;margin-top:5px;text-align:center;}
+
+/* ===== 历史会话标签 ===== */
+.history-pane{flex:1;overflow:hidden;display:flex;flex-direction:column;}
+.new-chat-btn{
+  margin:10px;padding:9px;border-radius:8px;
+  background:var(--primary-light);border:1px solid #bfdbfe;
+  color:var(--primary);font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;gap:6px;
+  transition:all .15s;font-weight:500;
+}
+.new-chat-btn:hover{background:#dbeafe;}
+.session-list{flex:1;overflow-y:auto;padding:0 8px 8px;}
+.session-list::-webkit-scrollbar{width:3px;}
+.session-list::-webkit-scrollbar-thumb{background:#e2e8f0;border-radius:2px;}
+.sg-title{color:var(--muted);font-size:11px;font-weight:600;padding:8px 8px 4px;text-transform:uppercase;letter-spacing:.05em;}
+.session-item{
+  padding:9px 11px;border-radius:8px;cursor:pointer;
+  color:var(--text);font-size:13px;margin-bottom:2px;
+  display:flex;align-items:flex-start;gap:8px;
+  transition:background .15s;border:1px solid transparent;
+}
+.session-item:hover{background:#f8fafc;border-color:var(--border);}
+.session-item.active{background:var(--primary-light);border-color:#bfdbfe;color:var(--primary);}
+.si-icon{font-size:14px;flex-shrink:0;margin-top:1px;}
+.si-text{flex:1;min-width:0;}
+.si-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4;font-weight:500;}
+.si-meta{font-size:11px;color:var(--muted);margin-top:2px;display:flex;justify-content:space-between;}
+
+/* ===== 记忆标签 ===== */
+.memory-pane{flex:1;overflow-y:auto;padding:14px;}
+.mem-section{margin-bottom:18px;}
+.mem-section-title{font-size:12px;font-weight:700;color:var(--text);margin-bottom:9px;display:flex;align-items:center;gap:5px;}
+.mem-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+.mem-card{background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:10px 12px;}
+.mem-card .v{font-size:22px;font-weight:800;color:var(--primary);}
+.mem-card .l{font-size:11px;color:var(--muted);margin-top:2px;}
+.mem-tags{display:flex;flex-wrap:wrap;gap:4px;}
+.mem-tag{padding:3px 9px;background:var(--primary-light);border:1px solid #bfdbfe;border-radius:20px;color:var(--primary);font-size:11px;}
+.mem-query{padding:7px 0;border-bottom:1px solid var(--border);font-size:12px;color:var(--text);line-height:1.5;}
+.mem-query:last-child{border-bottom:none;}
+.mem-context{font-size:12px;color:#475569;line-height:1.6;padding:10px;background:#f8fafc;border-radius:8px;border-left:3px solid var(--primary);}
+.mem-empty{text-align:center;color:var(--muted);font-size:13px;padding:40px 20px;}
+.mem-empty .ei{font-size:40px;margin-bottom:10px;}
+
+/* ===== 知识图谱标签 ===== */
+.kg-pane{flex:1;overflow-y:auto;padding:14px;}
+.kg-filter{display:flex;gap:8px;margin-bottom:12px;}
+.kg-select{flex:1;border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:13px;outline:none;color:var(--text);}
+.kg-query-btn{padding:7px 14px;background:var(--primary);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;transition:background .15s;}
+.kg-query-btn:hover{background:var(--primary-dark);}
+.kg-stats{font-size:12px;color:var(--muted);margin-bottom:10px;}
+.kg-node-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:11px 13px;margin-bottom:8px;}
+.kg-node-head{display:flex;align-items:center;gap:7px;margin-bottom:7px;}
+.kg-type{font-size:11px;padding:2px 7px;border-radius:20px;background:var(--primary-light);color:var(--primary);font-weight:600;}
+.kg-name{font-size:14px;font-weight:700;color:var(--text);}
+.kg-score{margin-left:auto;font-size:12px;color:var(--success);font-weight:700;}
+.kg-feats{display:flex;flex-wrap:wrap;gap:4px;}
+.kg-feat{font-size:11px;padding:2px 7px;border-radius:20px;background:#f0fdf4;color:#065f46;border:1px solid #a7f3d0;}
+.kg-empty{text-align:center;color:var(--muted);font-size:13px;padding:40px 20px;}
+.kg-empty .ei{font-size:40px;margin-bottom:10px;}
+.kg-edges{margin-top:12px;border-top:1px solid var(--border);padding-top:10px;}
+.kg-edge-title{font-size:12px;font-weight:700;color:var(--text);margin-bottom:7px;}
+.kg-edge-item{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);padding:4px 0;border-bottom:1px solid #f1f5f9;}
+.kg-edge-item:last-child{border-bottom:none;}
+.kg-edge-rel{color:#7c3aed;font-weight:600;}
+
+/* 响应式 */
+@media(max-width:768px){
+  :root{--panel:100vw;}
+  .map-area.panel-open{margin-right:0;}
+}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- 顶部栏 -->
+  <div class="topbar">
+    <div class="logo-wrap">
+      <div class="logo-icon">🗺️</div>
+      <div>
+        <div class="logo-name">路线大师</div>
+        <div class="logo-sub">运动智能伴侣 · 厦门</div>
+      </div>
+    </div>
+    <div class="topbar-sep"></div>
+    <button class="tbtn" :class="{active:panelOpen&&activeTab==='chat'}" @click="openTab('chat')">💬 AI对话</button>
+    <button class="tbtn" :class="{active:panelOpen&&activeTab==='history'}" @click="openTab('history')">📋 历史</button>
+    <button class="tbtn" :class="{active:panelOpen&&activeTab==='memory'}" @click="openTab('memory')">🧠 记忆</button>
+    <button class="tbtn" :class="{active:panelOpen&&activeTab==='kg'}" @click="openTab('kg')">🕸️ 图谱</button>
+    <div class="topbar-spacer"></div>
+    <div v-if="userMemory.session_count>0" class="memory-badge">🧠 已记忆 {{ userMemory.session_count }} 次</div>
+  </div>
+
+  <!-- 主布局 -->
+  <div class="layout">
+
+    <!-- 地图区域 -->
+    <div class="map-area" :class="{'panel-open':panelOpen}">
+      <div id="amap"></div>
+
+      <!-- 路线信息浮层（底部） -->
+      <div class="map-route-info" :class="{show:currentRoute}">
+        <div class="ri-stat"><div class="v">{{ currentRoute?.route?.total_distance_km }}</div><div class="l">公里</div></div>
+        <div class="ri-stat"><div class="v">{{ currentRoute?.route?.total_duration_min }}</div><div class="l">分钟</div></div>
+        <div class="ri-waypoints">
+          <template v-for="(wp,wi) in (currentRoute?.waypoints||[])" :key="wi">
+            <span class="ri-wp">{{ wp.name }}</span>
+            <span v-if="wi<(currentRoute?.waypoints?.length-1)" class="ri-arrow">→</span>
+          </template>
+        </div>
+        <button class="ri-close" @click="clearRoute">✕</button>
+      </div>
+
+      <!-- 悬浮聊天按钮 -->
+      <button class="map-fab" :class="{hidden:panelOpen}" @click="openTab('chat')">
+        💬
+        <div v-if="unread>0" class="fab-badge">{{ unread }}</div>
+      </button>
+    </div>
+
+    <!-- 右侧面板 -->
+    <div class="side-panel" :class="{open:panelOpen}">
+
+      <!-- 标签头 -->
+      <div class="panel-tabs">
+        <div class="ptab" :class="{active:activeTab==='chat'}" @click="activeTab='chat'">💬 对话</div>
+        <div class="ptab" :class="{active:activeTab==='history'}" @click="switchTab('history')">📋 历史</div>
+        <div class="ptab" :class="{active:activeTab==='memory'}" @click="switchTab('memory')">🧠 记忆</div>
+        <div class="ptab" :class="{active:activeTab==='kg'}" @click="switchTab('kg')">🕸️ 图谱</div>
+        <div class="ptab-close" @click="panelOpen=false">✕</div>
+      </div>
+
+      <!-- 标签内容 -->
+      <div class="tab-body">
+
+        <!-- ===== 聊天 ===== -->
+        <div class="tab-pane" :class="{active:activeTab==='chat'}">
+          <div class="chat-msgs" ref="msgBox">
+
+            <!-- 欢迎屏 -->
+            <div v-if="messages.length===0" class="welcome">
+              <div class="welcome-icon">🗺️</div>
+              <div class="welcome-title">你好！我是路线大师</div>
+              <div class="welcome-sub">告诉我你的运动需求，我来为你规划专属路线</div>
+              <div class="quick-list">
+                <button v-for="p in quickPrompts" :key="p.text" class="quick-item" @click="usePrompt(p.text)">
+                  <span>{{ p.icon }}</span><span>{{ p.text }}</span>
+                </button>
+              </div>
+            </div>
+
+            <!-- 消息列表 -->
+            <div v-for="(msg,idx) in messages" :key="idx" class="msg-row" :class="msg.role">
+              <div class="avatar" :class="msg.role">{{ msg.role==='user'?'你':'🤖' }}</div>
+              <div class="bubble-wrap">
+                <div class="bubble" :class="msg.role" v-html="renderMd(msg.content)"></div>
+
+                <!-- RAG知识片段 -->
+                <div v-if="msg.ragDocs&&msg.ragDocs.length>0" class="rag-panel">
+                  <div class="rag-title">📚 RAG 知识检索（{{ msg.ragDocs.length }} 条）</div>
+                  <div v-for="(doc,di) in msg.ragDocs.slice(0,2)" :key="di" class="rag-item">
+                    <strong>{{ doc.metadata?.area||'厦门' }}</strong>：{{ doc.text?doc.text.slice(0,90)+'...':'' }}
+                  </div>
+                </div>
+
+                <!-- 路线卡片 -->
+                <div v-if="msg.routeData" class="route-card">
+                  <div class="rc-head">🗺️ 路线规划完成</div>
+                  <div class="rc-body">
+                    <div class="rc-stats">
+                      <div class="rc-stat"><div class="v">{{ msg.routeData.route?.total_distance_km||0 }}</div><div class="l">公里</div></div>
+                      <div class="rc-stat"><div class="v">{{ msg.routeData.route?.total_duration_min||0 }}</div><div class="l">分钟</div></div>
+                      <div class="rc-stat"><div class="v">{{ (msg.routeData.waypoints||[]).length }}</div><div class="l">途经点</div></div>
+                    </div>
+                    <div class="wp-list">
+                      <div v-for="(wp,wi) in (msg.routeData.waypoints||[])" :key="wi" class="wp-item">
+                        <div class="wp-dot" :class="wi===0?'s':wi===(msg.routeData.waypoints.length-1)?'e':'m'"></div>
+                        {{ wp.name }}
+                      </div>
+                    </div>
+                    <div v-if="msg.routeData.recommendation" class="rc-rec">💡 {{ msg.routeData.recommendation }}</div>
+                    <button class="view-btn" @click="showRoute(msg.routeData)">📍 在地图上查看路线</button>
+                  </div>
+                </div>
+
+                <!-- Agent步骤 -->
+                <div v-if="msg.agentSteps&&msg.agentSteps.length>0" class="agent-panel">
+                  <div class="agent-title" @click="msg.showSteps=!msg.showSteps">
+                    ⚙️ Agent 推理（{{ msg.agentSteps.length }} 步）{{ msg.showSteps?'▲':'▼' }}
+                  </div>
+                  <template v-if="msg.showSteps">
+                    <div v-for="(st,si) in msg.agentSteps" :key="si" class="agent-step">
+                      <span class="si">{{ st.icon||'✓' }}</span>
+                      <span><strong>{{ st.step }}</strong>：{{ st.result }}</span>
+                    </div>
+                  </template>
+                </div>
+
+                <div class="msg-time">{{ msg.time }}</div>
+              </div>
+            </div>
+
+            <!-- 打字中 -->
+            <div v-if="isTyping" class="msg-row assistant">
+              <div class="avatar assistant">🤖</div>
+              <div class="bubble-wrap">
+                <div class="typing"><div class="td"></div><div class="td"></div><div class="td"></div></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 输入区 -->
+          <div class="input-area">
+            <div class="origin-bar">
+              <label>📍 起点：</label>
+              <input class="origin-input" v-model="originInput" placeholder="如：白城沙滩、厦门大学南门（留空用默认）">
+            </div>
+            <div class="input-wrap">
+              <textarea class="input-ta" v-model="inputText"
+                placeholder="告诉我你的运动需求，例如：从白城沙滩出发跑40分钟，脚踝有点不舒服..."
+                rows="1" ref="inputRef"
+                @keydown.enter.exact.prevent="send"
+                @keydown.enter.shift.exact="inputText+='\n'"
+                @input="autoResize"
+                :disabled="isSending">
+              </textarea>
+              <button class="send-btn" @click="send" :disabled="!inputText.trim()||isSending">
+                {{ isSending?'⏳':'➤' }}
+              </button>
+            </div>
+            <div class="input-hint">Enter 发送 · Shift+Enter 换行 · 支持多轮对话</div>
+          </div>
+        </div>
+
+        <!-- ===== 历史会话 ===== -->
+        <div class="tab-pane" :class="{active:activeTab==='history'}">
+          <div class="history-pane">
+            <button class="new-chat-btn" @click="newChat">✏️ 新建对话</button>
+            <div class="session-list">
+              <div v-if="sessions.length===0" style="color:var(--muted);font-size:13px;padding:16px;text-align:center;">暂无历史对话</div>
+              <template v-for="(group,gk) in groupedSessions" :key="gk">
+                <div class="sg-title">{{ gk }}</div>
+                <div v-for="s in group" :key="s.session_id"
+                     class="session-item" :class="{active:s.session_id===currentSessionId}"
+                     @click="loadSession(s.session_id)">
+                  <span class="si-icon">💬</span>
+                  <div class="si-text">
+                    <div class="si-title">{{ s.title||'新对话' }}</div>
+                    <div class="si-meta">
+                      <span>{{ s.message_count }}条</span>
+                      <span>{{ fmtRelTime(s.updated_at) }}</span>
+                    </div>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== 长期记忆 ===== -->
+        <div class="tab-pane" :class="{active:activeTab==='memory'}">
+          <div class="memory-pane">
+            <div v-if="!userMemory.session_count" class="mem-empty">
+              <div class="ei">🧠</div>
+              <div>开始对话后，系统会自动记录你的运动偏好</div>
+            </div>
+            <template v-else>
+              <div class="mem-section">
+                <div class="mem-section-title">📊 使用统计</div>
+                <div class="mem-grid">
+                  <div class="mem-card"><div class="v">{{ userMemory.session_count }}</div><div class="l">总对话次数</div></div>
+                  <div class="mem-card"><div class="v">{{ userMemory.common_duration||'--' }}</div><div class="l">常用时长(分)</div></div>
+                </div>
+              </div>
+              <div class="mem-section" v-if="Object.keys(userMemory.activity_stats||{}).length">
+                <div class="mem-section-title">🏃 活动偏好</div>
+                <div class="mem-tags">
+                  <span v-for="(cnt,act) in userMemory.activity_stats" :key="act" class="mem-tag">{{ act }} ×{{ cnt }}</span>
+                </div>
+              </div>
+              <div class="mem-section" v-if="Object.keys(userMemory.preference_stats||{}).length">
+                <div class="mem-section-title">⭐ 偏好特征</div>
+                <div class="mem-tags">
+                  <span v-for="(cnt,feat) in userMemory.preference_stats" :key="feat" class="mem-tag">{{ featLabel(feat) }} ×{{ cnt }}</span>
+                </div>
+              </div>
+              <div class="mem-section" v-if="userMemory.recent_queries?.length">
+                <div class="mem-section-title">🕐 最近查询</div>
+                <div v-for="(q,qi) in userMemory.recent_queries.slice(0,5)" :key="qi" class="mem-query">{{ q.query }}</div>
+              </div>
+              <div class="mem-section" v-if="userMemory.context_string">
+                <div class="mem-section-title">💡 AI记忆摘要</div>
+                <div class="mem-context">{{ userMemory.context_string }}</div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- ===== 知识图谱 ===== -->
+        <div class="tab-pane" :class="{active:activeTab==='kg'}">
+          <div class="kg-pane">
+            <div class="kg-filter">
+              <select class="kg-select" v-model="kgActivity">
+                <option>跑步</option><option>散步</option><option>骑行</option><option>徒步</option>
+              </select>
+              <button class="kg-query-btn" @click="loadKG">查询</button>
+            </div>
+            <div v-if="kgData" class="kg-stats">共 {{ kgData.total_nodes }} 个节点 · {{ kgData.total_edges }} 条关系边</div>
+            <div v-if="!kgData" class="kg-empty">
+              <div class="ei">🕸️</div>
+              <div>点击查询加载厦门地点知识图谱</div>
+            </div>
+            <template v-else>
+              <div v-for="node in (kgData.nodes||[])" :key="node.node_id" class="kg-node-card">
+                <div class="kg-node-head">
+                  <span class="kg-type">{{ node.type }}</span>
+                  <span class="kg-name">{{ node.name }}</span>
+                  <span class="kg-score">推荐度 {{ node.score }}</span>
+                </div>
+                <div class="kg-feats">
+                  <span v-for="f in (node.features||[])" :key="f" class="kg-feat">{{ f }}</span>
+                </div>
+              </div>
+              <div v-if="(kgData.edges||[]).length>0" class="kg-edges">
+                <div class="kg-edge-title">地点关系</div>
+                <div v-for="edge in (kgData.edges||[]).slice(0,8)" :key="edge.id" class="kg-edge-item">
+                  <span>{{ edge.source_name }}</span>
+                  <span class="kg-edge-rel">→{{ edge.relation }}→</span>
+                  <span>{{ edge.target_name }}</span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+      </div><!-- end tab-body -->
+    </div><!-- end side-panel -->
+
+  </div><!-- end layout -->
+</div>
+
+<script>
+const { createApp, ref, reactive, computed, onMounted, nextTick } = Vue;
+const API_BASE = '';  // 前后端同域，使用相对路径
+
+function getOrCreateSessionId() {
+  let sid = localStorage.getItem('current_session_id');
+  if (!sid) {
+    sid = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+    localStorage.setItem('current_session_id', sid);
+  }
+  return sid;
+}
+
+createApp({
+  setup() {
+    // ===== 状态 =====
+    const panelOpen = ref(false);
+    const activeTab = ref('chat');
+    const messages = ref([]);
+    const inputText = ref('');
+    const originInput = ref('');
+    const isTyping = ref(false);
+    const isSending = ref(false);
+    const currentRoute = ref(null);
+    const userMemory = ref({});
+    const sessions = ref([]);
+    const kgData = ref(null);
+    const kgActivity = ref('跑步');
+    const unread = ref(0);
+    const msgBox = ref(null);
+    const inputRef = ref(null);
+    const currentSessionId = ref(getOrCreateSessionId());
+
+    let amapInstance = null;
+    let routePolyline = null;
+    let routeMarkers = [];
+
+    const quickPrompts = [
+      { icon:'🏃', text:'从白城沙滩出发跑步40分钟，脚踝有点不舒服' },
+      { icon:'🚶', text:'轻松散步30分钟，想看海景' },
+      { icon:'🚴', text:'从厦大南门出发骑行1小时' },
+      { icon:'🌿', text:'找有树荫的地方跑步，时间1小时' },
+      { icon:'🍜', text:'运动后想顺便吃点东西，推荐路线' },
+    ];
+
+    const featLabels = { scenic:'风景', shade:'树荫', sea_view:'海景', park:'公园', water:'水站', soft_surface:'软路面' };
+
+    const groupedSessions = computed(() => {
+      const now = new Date();
+      const today = now.toDateString();
+      const yesterday = new Date(now - 86400000).toDateString();
+      const groups = {};
+      sessions.value.forEach(s => {
+        const d = new Date(s.updated_at);
+        const key = d.toDateString()===today?'今天':d.toDateString()===yesterday?'昨天':'更早';
+        if (!groups[key]) groups[key] = [];
+        groups[key].push(s);
+      });
+      return groups;
+    });
+
+    // ===== 初始化地图 =====
+    function initMap() {
+      amapInstance = new AMap.Map('amap', {
+        zoom: 13,
+        center: [118.0894, 24.4798],
+        mapStyle: 'amap://styles/normal',
+      });
+      amapInstance.addControl(new AMap.Scale());
+      amapInstance.addControl(new AMap.ToolBar({ position: 'RB' }));
+    }
+
+    // ===== 面板切换 =====
+    function openTab(tab) {
+      if (panelOpen.value && activeTab.value === tab) {
+        panelOpen.value = false;
+      } else {
+        panelOpen.value = true;
+        activeTab.value = tab;
+        if (tab === 'chat') { unread.value = 0; nextTick(() => inputRef.value?.focus()); }
+      }
+    }
+
+    function switchTab(tab) {
+      activeTab.value = tab;
+      if (tab === 'history') loadSessions();
+      if (tab === 'memory') loadUserMemory();
+      if (tab === 'kg') loadKG();
+    }
+
+    // ===== 发送消息 =====
+    async function send() {
+      const text = inputText.value.trim();
+      if (!text || isSending.value) return;
+
+      messages.value.push({ role:'user', content:text, time:fmtTime() });
+      inputText.value = '';
+      isSending.value = true;
+      isTyping.value = true;
+      scrollBottom();
+
+      const aiIdx = messages.value.length;
+      messages.value.push({
+        role:'assistant', content:'', time:fmtTime(),
+        routeData:null, agentSteps:[], ragDocs:[], showSteps:false
+      });
+
+      try {
+        const resp = await fetch(`${API_BASE}/api/chat/message/`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({
+            message: text,
+            session_id: currentSessionId.value,
+            origin: originInput.value.trim(),
+          }),
+        });
+        if (!resp.ok) {
+          messages.value[aiIdx].content = `❌ 请求失败 (${resp.status})，请重试`;
+          return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream:true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const js = line.slice(6).trim();
+            if (!js) continue;
+            try {
+              const ev = JSON.parse(js);
+              isTyping.value = false;
+              if (ev.type === 'token') {
+                messages.value[aiIdx].content += ev.content;
+                scrollBottom();
+              } else if (ev.type === 'route_plan') {
+                messages.value[aiIdx].routeData = ev.route_data;
+                messages.value[aiIdx].agentSteps = ev.route_data.agent_steps || [];
+                messages.value[aiIdx].ragDocs = ev.route_data.rag_docs || [];
+                showRoute(ev.route_data);
+                scrollBottom();
+              } else if (ev.type === 'rag_context') {
+                messages.value[aiIdx].ragDocs = ev.docs || [];
+              } else if (ev.type === 'error') {
+                messages.value[aiIdx].content += `\n\n❌ ${ev.error}`;
+              }
+            } catch {}
+          }
+        }
+      } catch(e) {
+        isTyping.value = false;
+        messages.value[aiIdx].content = `❌ 网络错误：${e.message}`;
+      } finally {
+        isSending.value = false;
+        isTyping.value = false;
+        scrollBottom();
+        if (!panelOpen.value || activeTab.value !== 'chat') unread.value++;
+        loadUserMemory();
+        loadSessions();
+      }
+    }
+
+    // ===== 地图路线展示 =====
+    function showRoute(routeData) {
+      if (!amapInstance) return;
+      clearRoute();
+      currentRoute.value = routeData;
+
+      const polyline = routeData?.route?.polyline || [];
+      if (polyline.length > 0) {
+        const path = polyline.map(p => new AMap.LngLat(p[0], p[1]));
+        routePolyline = new AMap.Polyline({
+          path, strokeColor:'#2563eb', strokeWeight:5,
+          strokeOpacity:.9, lineJoin:'round', lineCap:'round',
+        });
+        amapInstance.add(routePolyline);
+      }
+
+      (routeData.waypoints||[]).forEach((wp, idx) => {
+        const isS = idx===0, isE = idx===routeData.waypoints.length-1;
+        const color = isS?'#10b981':isE?'#ef4444':'#2563eb';
+        const label = isS?'起':isE?'终':String(idx);
+        const marker = new AMap.Marker({
+          position:[wp.lng, wp.lat],
+          content:`<div style="width:26px;height:26px;background:${color};border-radius:50%;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700;">${label}</div>`,
+          offset:new AMap.Pixel(-13,-13), title:wp.name,
+        });
+        amapInstance.add(marker);
+        routeMarkers.push(marker);
+      });
+
+      if (polyline.length > 0) amapInstance.setFitView([routePolyline, ...routeMarkers]);
+    }
+
+    function clearRoute() {
+      if (routePolyline && amapInstance) { amapInstance.remove(routePolyline); routePolyline = null; }
+      routeMarkers.forEach(m => amapInstance?.remove(m));
+      routeMarkers = [];
+      currentRoute.value = null;
+    }
+
+    // ===== 加载会话列表 =====
+    async function loadSessions() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/chat/sessions/`);
+        if (resp.ok) sessions.value = (await resp.json()).sessions || [];
+      } catch {}
+    }
+
+    // ===== 加载指定会话 =====
+    async function loadSession(sessionId) {
+      currentSessionId.value = sessionId;
+      localStorage.setItem('current_session_id', sessionId);
+      activeTab.value = 'chat';
+      messages.value = [];
+      try {
+        const resp = await fetch(`${API_BASE}/api/chat/history/?session_id=${sessionId}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          messages.value = (data.messages||[]).map(m => ({
+            role: m.role,
+            content: m.content,
+            time: fmtRelTime(m.created_at),
+            routeData: m.extra_data?.route_data || null,
+            agentSteps: m.extra_data?.agent_steps || [],
+            ragDocs: m.extra_data?.rag_docs || [],
+            showSteps: false,
+          }));
+          scrollBottom();
+        }
+      } catch {}
+    }
+
+    // ===== 新建对话 =====
+    function newChat() {
+      const sid = 'user_' + Date.now() + '_' + Math.random().toString(36).substr(2,6);
+      currentSessionId.value = sid;
+      localStorage.setItem('current_session_id', sid);
+      messages.value = [];
+      clearRoute();
+      activeTab.value = 'chat';
+    }
+
+    // ===== 加载用户记忆 =====
+    async function loadUserMemory() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/chat/memory/?session_id=${currentSessionId.value}`);
+        if (resp.ok) userMemory.value = await resp.json();
+      } catch {}
+    }
+
+    // ===== 加载知识图谱 =====
+    async function loadKG() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/route/kg/?activity=${encodeURIComponent(kgActivity.value)}`);
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.success) kgData.value = data;
+        }
+      } catch {}
+    }
+
+    // ===== 工具函数 =====
+    function renderMd(content) {
+      if (!content) return '';
+      try { return marked.parse(content); } catch { return content.replace(/\n/g,'<br>'); }
+    }
+
+    function scrollBottom() {
+      nextTick(() => { if (msgBox.value) msgBox.value.scrollTop = msgBox.value.scrollHeight; });
+    }
+
+    function fmtTime() {
+      const n = new Date();
+      return `${n.getHours().toString().padStart(2,'0')}:${n.getMinutes().toString().padStart(2,'0')}`;
+    }
+
+    function fmtRelTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso), now = new Date(), diff = now - d;
+      if (diff < 60000) return '刚刚';
+      if (diff < 3600000) return Math.floor(diff/60000) + '分钟前';
+      if (diff < 86400000) return Math.floor(diff/3600000) + '小时前';
+      return d.toLocaleDateString('zh-CN', { month:'numeric', day:'numeric' });
+    }
+
+    function featLabel(key) { return featLabels[key] || key; }
+
+    function usePrompt(text) { inputText.value = text; openTab('chat'); }
+
+    function autoResize(e) {
+      const el = e.target; el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 90) + 'px';
+    }
+
+    onMounted(() => {
+      initMap();
+      loadUserMemory();
+      loadSessions();
+    });
+
+    return {
+      panelOpen, activeTab, messages, inputText, originInput,
+      isTyping, isSending, currentRoute, userMemory, sessions,
+      groupedSessions, kgData, kgActivity, unread,
+      msgBox, inputRef, quickPrompts, currentSessionId,
+      openTab, switchTab, send, showRoute, clearRoute,
+      loadSessions, loadSession, newChat, loadUserMemory, loadKG,
+      renderMd, fmtRelTime, featLabel, usePrompt, autoResize,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
