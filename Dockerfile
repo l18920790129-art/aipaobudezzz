@@ -19,8 +19,11 @@ COPY . .
 # 收集静态文件（忽略错误）
 RUN python manage.py collectstatic --noinput || true
 
-# 暴露端口（Railway使用PORT环境变量）
+# 暴露端口（Railway使用PORT环境变量动态分配）
 EXPOSE 8080
 
+# 确保startup.sh有执行权限
+RUN chmod +x startup.sh
+
 # 启动脚本（迁移 + 初始化知识图谱 + 启动gunicorn）
-CMD ["bash", "startup.sh"]
+CMD ["/bin/bash", "startup.sh"]
