@@ -213,11 +213,9 @@ def route_history_api(request):
 
 @require_http_methods(['GET'])
 def health_check(request):
-    from .models import KGNode, KGEdge
+    """快速健康检查端点 - 不查询数据库，立即响应"""
     return cors_response({
         'status': 'ok',
         'service': '运动智能伴侣·路线大师',
-        'version': 'v7.1',
-        'kg_nodes': KGNode.objects.count(),
-        'kg_edges': KGEdge.objects.count(),
+        'version': 'v8.0',
     })
