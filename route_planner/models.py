@@ -1,5 +1,6 @@
 """
-route_planner/models.py - PostgreSQL 地理实体存储
+route_planner/models.py (v12-fixed)
+修复：增加 __str__ 方法、recommended_route 截断防止 JSON 过大
 """
 from django.db import models
 
@@ -26,6 +27,9 @@ class PoiEntity(models.Model):
             models.Index(fields=['city', 'poi_type']),
             models.Index(fields=['name']),
         ]
+
+    def __str__(self):
+        return f"{self.name} ({self.city})"
 
     def to_dict(self):
         return {
@@ -57,6 +61,9 @@ class RouteHistory(models.Model):
         ordering = ['-created_at']
         indexes = [models.Index(fields=['session_id', '-created_at'])]
 
+    def __str__(self):
+        return f"[{self.session_id}] {self.user_query[:30]}"
+
 
 class UserPreference(models.Model):
     """用户长期偏好记忆"""
@@ -73,7 +80,11 @@ class UserPreference(models.Model):
     class Meta:
         db_table = 'user_preferences'
 
+    def __str__(self):
+        return f"Pref({self.session_id}, count={self.session_count})"
+
     def add_query(self, query: str, params: dict, recommended_route: str = ''):
+        """记录一次查询到偏好中"""
         self.session_count += 1
         activity = params.get('activity_type', '跑步')
         self.activity_stats[activity] = self.activity_stats.get(activity, 0) + 1
@@ -86,7 +97,7 @@ class UserPreference(models.Model):
             'query': query[:100],
             'activity': activity,
             'duration': params.get('duration_min', 0),
-            'recommended': recommended_route,
+            'recommended': recommended_route[:200] if recommended_route else '',
         }
         queries = self.recent_queries or []
         queries.insert(0, entry)
@@ -126,15 +137,17 @@ class KGNode(models.Model):
     gcj_lng = models.FloatField(null=True, blank=True)
     gcj_lat = models.FloatField(null=True, blank=True)
     city = models.CharField(max_length=50, default='厦门')
-    # 运动属性
-    suitable_activities = models.JSONField(default=list)   # ['跑步','散步','骑行']
-    surface_types = models.JSONField(default=list)          # ['软路面','木栈道','塑胶']
-    features = models.JSONField(default=list)               # ['海景','树荫','无障碍']
+    suitable_activities = models.JSONField(default=list)
+    surface_types = models.JSONField(default=list)
+    features = models.JSONField(default=list)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'kg_nodes'
         indexes = [models.Index(fields=['city', 'node_type'])]
+
+    def __str__(self):
+        return f"{self.name} ({self.node_type})"
 
     def to_dict(self):
         return {
@@ -162,13 +175,16 @@ class KGEdge(models.Model):
     source = models.ForeignKey(KGNode, on_delete=models.CASCADE, related_name='out_edges')
     target = models.ForeignKey(KGNode, on_delete=models.CASCADE, related_name='in_edges')
     relation = models.CharField(max_length=20, choices=RELATION_TYPES)
-    weight = models.FloatField(default=1.0)   # 关系强度/距离
+    weight = models.FloatField(default=1.0)
     description = models.CharField(max_length=200, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'kg_edges'
         unique_together = [('source', 'target', 'relation')]
+
+    def __str__(self):
+        return f"{self.source.name} --{self.relation}--> {self.target.name}"
 
     def to_dict(self):
         return {

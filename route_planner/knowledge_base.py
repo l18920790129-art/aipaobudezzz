@@ -1,13 +1,14 @@
 """
-knowledge_base.py - ChromaDB 知识向量存储与RAG检索
-功能：
-1. 厦门运动路线知识库（向量化存储）
-2. 用户历史对话记忆（向量化存储）
-3. 语义相似度检索（RAG）
+knowledge_base.py (v12-fixed)
+修复：
+1. n_results=0 导致 ChromaDB 异常
+2. 移除未使用的 embedding_functions 导入
+3. MD5 使用 usedforsecurity=False
+4. 增加线程安全保护
 """
 import logging
+import threading
 import chromadb
-from chromadb.utils import embedding_functions
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -69,18 +70,21 @@ XIAMEN_KNOWLEDGE_DOCS = [
 ]
 
 # ============================================================
-# ChromaDB 客户端（单例）
+# ChromaDB 客户端（线程安全单例）
 # ============================================================
 _chroma_client = None
 _route_collection = None
 _memory_collection = None
+_lock = threading.Lock()
 
 
 def get_chroma_client():
     global _chroma_client
     if _chroma_client is None:
-        _chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
-        logger.info(f"[ChromaDB] 初始化完成，持久化目录: {settings.CHROMA_PERSIST_DIR}")
+        with _lock:
+            if _chroma_client is None:
+                _chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
+                logger.info(f"[ChromaDB] 初始化完成，持久化目录: {settings.CHROMA_PERSIST_DIR}")
     return _chroma_client
 
 
@@ -88,15 +92,15 @@ def get_route_collection():
     """获取路线知识库集合"""
     global _route_collection
     if _route_collection is None:
-        client = get_chroma_client()
-        # 使用默认embedding（基于sentence-transformers，不需要额外API）
-        _route_collection = client.get_or_create_collection(
-            name="xiamen_routes",
-            metadata={"description": "厦门运动路线知识库"}
-        )
-        # 检查是否需要初始化数据
-        if _route_collection.count() == 0:
-            _init_route_knowledge(_route_collection)
+        with _lock:
+            if _route_collection is None:
+                client = get_chroma_client()
+                _route_collection = client.get_or_create_collection(
+                    name="xiamen_routes",
+                    metadata={"description": "厦门运动路线知识库"}
+                )
+                if _route_collection.count() == 0:
+                    _init_route_knowledge(_route_collection)
     return _route_collection
 
 
@@ -104,11 +108,13 @@ def get_memory_collection():
     """获取用户历史对话记忆集合"""
     global _memory_collection
     if _memory_collection is None:
-        client = get_chroma_client()
-        _memory_collection = client.get_or_create_collection(
-            name="user_memories",
-            metadata={"description": "用户历史对话记忆"}
-        )
+        with _lock:
+            if _memory_collection is None:
+                client = get_chroma_client()
+                _memory_collection = client.get_or_create_collection(
+                    name="user_memories",
+                    metadata={"description": "用户历史对话记忆"}
+                )
     return _memory_collection
 
 
@@ -131,15 +137,18 @@ def _init_route_knowledge(collection):
 # RAG检索
 # ============================================================
 def retrieve_route_knowledge(query: str, n_results: int = 3) -> list:
-    """
-    检索相关路线知识
-    返回: [{'text': str, 'metadata': dict, 'distance': float}, ...]
-    """
+    """检索相关路线知识"""
     try:
         collection = get_route_collection()
+        count = collection.count()
+        # 修复：count 为 0 时直接返回空列表，避免 ChromaDB 异常
+        if count == 0:
+            logger.warning("[ChromaDB RAG] 知识库为空，跳过检索")
+            return []
+        actual_n = min(n_results, count)
         results = collection.query(
             query_texts=[query],
-            n_results=min(n_results, collection.count()),
+            n_results=actual_n,
         )
         docs = []
         if results and results.get('documents'):
@@ -159,14 +168,13 @@ def retrieve_route_knowledge(query: str, n_results: int = 3) -> list:
 
 def add_memory(session_id: str, user_query: str, ai_response: str,
                route_info: str = '', metadata: dict = None):
-    """
-    将一次对话记录存入向量记忆库
-    """
+    """将一次对话记录存入向量记忆库"""
     try:
         collection = get_memory_collection()
         import hashlib
         import time
-        doc_id = f"mem_{session_id}_{hashlib.md5(user_query.encode()).hexdigest()[:8]}_{int(time.time())}"
+        # 修复：使用 usedforsecurity=False 消除安全警告
+        doc_id = f"mem_{session_id}_{hashlib.md5(user_query.encode(), usedforsecurity=False).hexdigest()[:8]}_{int(time.time())}"
         text = f"用户问：{user_query}\nAI回答：{ai_response[:200]}"
         if route_info:
             text += f"\n路线信息：{route_info}"
@@ -186,9 +194,7 @@ def add_memory(session_id: str, user_query: str, ai_response: str,
 
 
 def retrieve_memory(session_id: str, query: str, n_results: int = 3) -> list:
-    """
-    检索用户历史记忆
-    """
+    """检索用户历史记忆"""
     try:
         collection = get_memory_collection()
         count = collection.count()

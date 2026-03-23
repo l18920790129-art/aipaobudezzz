@@ -1,21 +1,44 @@
 """
-amap_service.py - 高德地图 API 真实调用模块
+amap_service.py (v12-fixed)
 修复：
-1. 过滤渡轮/轮渡路段（禁止坐船路线混入跑步路线）
-2. 禁止直线降级连接（直线会穿越水域/建筑）
-3. 步行路线严格过滤非步行路段
+1. 使用 requests.Session 连接池（减少TCP握手开销）
+2. 增加请求重试机制
+3. 统一超时配置
+4. 保留渡轮过滤和直线降级禁止逻辑
 """
 import math
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 AMAP_KEY = settings.AMAP_WEB_KEY
 AMAP_BASE = 'https://restapi.amap.com'
+AMAP_TIMEOUT = 15
 
 FERRY_KEYWORDS = ['轮渡', '渡轮', '渡口', '轮船', '坐船', '乘船', '摆渡', 'ferry']
+
+# 连接池（单例）
+_session = None
+
+
+def _get_session():
+    """获取带重试机制的 requests Session"""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
+        _session.mount("https://", adapter)
+        _session.mount("http://", adapter)
+    return _session
 
 
 def _transform_lat(x, y):
@@ -75,7 +98,8 @@ def geocode(address: str, city: str = '厦门') -> dict:
     url = f"{AMAP_BASE}/v3/geocode/geo"
     params = {'key': AMAP_KEY, 'address': address, 'city': city, 'output': 'JSON'}
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        session = _get_session()
+        resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"[高德地理编码] 查询: {address}, 状态: {data.get('status')}")
@@ -109,7 +133,8 @@ def search_poi_by_keyword(keyword: str, city: str = '厦门',
     if poi_types:
         params['types'] = poi_types
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        session = _get_session()
+        resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         if data.get('status') != '1':
@@ -152,7 +177,8 @@ def search_poi_around(center_lng: float, center_lat: float,
     if poi_types:
         params['types'] = poi_types
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        session = _get_session()
+        resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         if data.get('status') != '1':
@@ -181,10 +207,7 @@ def search_poi_around(center_lng: float, center_lat: float,
 def plan_walking_route(origin_lng: float, origin_lat: float,
                         dest_lng: float, dest_lat: float,
                         reject_ferry: bool = True) -> dict:
-    """
-    高德步行路径规划 v3
-    reject_ferry=True 时若检测到渡轮路段则抛出异常
-    """
+    """高德步行路径规划 v3，reject_ferry=True 时拒绝渡轮路段"""
     url = f"{AMAP_BASE}/v3/direction/walking"
     params = {
         'key': AMAP_KEY,
@@ -193,7 +216,8 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
         'output': 'JSON',
     }
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        session = _get_session()
+        resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"[高德步行规划] {origin_lng},{origin_lat} -> {dest_lng},{dest_lat}, 状态: {data.get('status')}")
@@ -209,7 +233,6 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
         path = paths[0]
         steps = path.get('steps', [])
 
-        # 关键修复：检测并拒绝渡轮路段
         if reject_ferry and _contains_ferry(steps):
             raise ValueError("路线包含渡轮/轮渡路段，两点之间有水域阻隔，请选择同一陆地区域内的途经点")
 
@@ -251,7 +274,8 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
         'output': 'JSON',
     }
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        session = _get_session()
+        resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         if data.get('errcode') != 0 and data.get('status') != '1':
@@ -289,10 +313,7 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
 
 
 def build_multi_segment_route(waypoints: list, activity_type: str = '步行') -> dict:
-    """
-    多段路线规划
-    修复：禁止直线降级连接（原代码在失败时用直线连接导致穿越水域/建筑）
-    """
+    """多段路线规划，禁止直线降级连接"""
     if len(waypoints) < 2:
         raise ValueError("至少需要2个途经点")
 
@@ -306,7 +327,6 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
         origin = waypoints[i]
         dest = waypoints[i + 1]
 
-        # 检查直线距离，超过15km在厦门岛内不合理
         straight_dist = _haversine_distance(
             origin['lng'], origin['lat'],
             dest['lng'], dest['lat']
@@ -346,7 +366,6 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
             logger.info(f"[多段路线] 第{i+1}段成功: {origin['name']} -> {dest['name']}, {seg['distance']}m")
 
         except Exception as e:
-            # 关键修复：不再用直线连接，直接跳过失败路段
             logger.warning(f"[多段路线] 第{i+1}段跳过({e}): {origin['name']} -> {dest['name']}")
             failed_segments.append({
                 'from': origin['name'],

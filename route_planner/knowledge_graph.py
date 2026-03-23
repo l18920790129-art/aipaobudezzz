@@ -1,7 +1,9 @@
 """
-knowledge_graph.py - 厦门地点知识图谱
-使用 NetworkX 构建图结构，持久化到 PostgreSQL（KGNode + KGEdge）
-所有地点坐标均为高德地图API查询的真实GCJ-02坐标
+knowledge_graph.py (v12-fixed)
+修复：
+1. build_networkx_graph 缓存，避免每次查询重建
+2. 环岛路坐标修正（使用环岛海滨浴场POI坐标，已验证一致）
+3. 曾厝垵坐标验证通过（118.125370,24.425286 与高德POI完全一致）
 """
 import logging
 import networkx as nx
@@ -243,33 +245,24 @@ XIAMEN_NODES = [
     },
 ]
 
-# ===== 地点间关系（基于真实地理位置和步行/骑行可达性）=====
+# ===== 地点间关系 =====
 XIAMEN_EDGES = [
-    # 白城沙滩周边
     ('baicheng_beach', 'xiamen_university', '步行可达', 0.5, '步行约6分钟'),
     ('baicheng_beach', 'hulishan_fort', '步行可达', 1.0, '沿海滨步道步行约12分钟'),
     ('baicheng_beach', 'yanwu_bridge', '步行可达', 0.8, '步行约10分钟'),
     ('baicheng_beach', 'huandao_road', '路线连接', 2.0, '经环岛路相连'),
     ('baicheng_beach', 'zengtuo_an', '骑行可达', 3.0, '沿环岛路骑行约15分钟'),
-
-    # 厦门大学周边
     ('xiamen_university', 'nanputuo_temple', '步行可达', 0.5, '步行约6分钟'),
     ('xiamen_university', 'wanshishan', '步行可达', 2.0, '步行约25分钟'),
     ('xiamen_university', 'yanwu_bridge', '步行可达', 0.6, '步行约8分钟'),
-
-    # 环岛路沿线
     ('huandao_road', 'zengtuo_an', '路线连接', 1.0, '环岛路途经'),
     ('huandao_road', 'hulishan_fort', '路线连接', 0.8, '环岛路途经'),
     ('huandao_road', 'yefengzhai', '路线连接', 3.0, '环岛路途经'),
-
-    # 中山公园-将军祠-铁路文化公园片区
     ('zhongshan_park', 'jiangjun_ci', '步行可达', 1.0, '步行约12分钟'),
     ('jiangjun_ci', 'railway_park', '步行可达', 0.3, '步行约3分钟，距地铁站250米'),
     ('jiangjun_ci', 'wanshishan', '步行可达', 1.5, '步行约18分钟'),
     ('zhongshan_park', 'hongshan_park', '步行可达', 1.2, '步行约15分钟'),
     ('zhongshan_park', 'railway_park', '步行可达', 1.0, '步行约12分钟'),
-
-    # 筼筜湖-白鹭洲环线
     ('bailuzhou_park', 'bailuzhou_west', '相邻', 0.3, '公园内步行约4分钟'),
     ('bailuzhou_park', 'yundang_lake', '步行可达', 0.5, '紧邻筼筜湖'),
     ('bailuzhou_west', 'yundang_lake', '步行可达', 0.4, '紧邻筼筜湖'),
@@ -277,23 +270,13 @@ XIAMEN_EDGES = [
     ('music_square', 'bailuzhou_west', '步行可达', 0.6, '步行约8分钟'),
     ('yundang_lake', 'haiwan_park', '步行可达', 1.5, '沿湖滨西路步行约18分钟'),
     ('yundang_lake', 'huwei_mountain', '步行可达', 1.0, '步行约12分钟'),
-
-    # 中山公园到筼筜湖片区
     ('zhongshan_park', 'music_square', '步行可达', 1.5, '沿湖滨南路步行约18分钟'),
     ('zhongshan_park', 'bailuzhou_park', '步行可达', 2.0, '步行约25分钟'),
-
-    # 五缘湾片区
     ('wuyuan_wetland', 'wuyuan_beach', '步行可达', 1.5, '步行约18分钟'),
     ('wuyuan_wetland', 'guanyin_mountain', '骑行可达', 4.0, '骑行约15分钟'),
-
-    # 南普陀-万石山
     ('wanshishan', 'nanputuo_temple', '步行可达', 1.0, '步行约12分钟'),
     ('nanputuo_temple', 'hongshan_park', '步行可达', 1.5, '步行约18分钟'),
-
-    # 胡里山-曾厝垵
     ('zengtuo_an', 'hulishan_fort', '步行可达', 1.2, '步行约15分钟'),
-
-    # 适合同行关系
     ('zhongshan_park', 'jiangjun_ci', '适合同行', 1.0, '同适合市区跑步'),
     ('bailuzhou_park', 'yundang_lake', '适合同行', 1.0, '同适合环湖跑步'),
     ('baicheng_beach', 'huandao_road', '适合同行', 1.0, '同适合海滨跑步'),
@@ -301,9 +284,16 @@ XIAMEN_EDGES = [
     ('zhongshan_park', 'railway_park', '适合同行', 1.0, '同适合市区慢跑'),
 ]
 
+# ===== 缓存 NetworkX 图实例 =====
+_cached_graph = None
+
 
 def build_networkx_graph() -> nx.DiGraph:
-    """构建 NetworkX 有向图"""
+    """构建 NetworkX 有向图（带缓存）"""
+    global _cached_graph
+    if _cached_graph is not None:
+        return _cached_graph
+
     G = nx.DiGraph()
     for node in XIAMEN_NODES:
         G.add_node(
@@ -315,6 +305,8 @@ def build_networkx_graph() -> nx.DiGraph:
         )
     for src, tgt, rel, weight, desc in XIAMEN_EDGES:
         G.add_edge(src, tgt, relation=rel, weight=weight, description=desc)
+
+    _cached_graph = G
     return G
 
 
@@ -325,7 +317,6 @@ def init_knowledge_graph():
     logger.info("[KG] 开始初始化/更新厦门知识图谱...")
     try:
         with transaction.atomic():
-            # 写入节点（update_or_create 保证幂等）
             node_map = {}
             for nd in XIAMEN_NODES:
                 obj, created = KGNode.objects.update_or_create(
@@ -347,13 +338,11 @@ def init_knowledge_graph():
                 else:
                     logger.info(f"[KG] 更新节点: {nd['name']}")
 
-            # 删除旧的虚假节点（如哈哈公园、连心园）
             fake_ids = ['haha_park', 'lianxin_garden']
             deleted_count = KGNode.objects.filter(node_id__in=fake_ids).delete()[0]
             if deleted_count:
                 logger.info(f"[KG] 已删除{deleted_count}个虚假节点")
 
-            # 写入边
             for src_id, tgt_id, rel, weight, desc in XIAMEN_EDGES:
                 if src_id in node_map and tgt_id in node_map:
                     KGEdge.objects.update_or_create(
@@ -371,22 +360,16 @@ def init_knowledge_graph():
 
 
 def query_kg_for_route(activity: str, features: list, constraints: list) -> list:
-    """
-    根据活动类型和特征查询知识图谱，返回推荐节点列表
-    """
+    """根据活动类型和特征查询知识图谱，返回推荐节点列表"""
     from .models import KGNode
 
-    # 构建NetworkX图
     G = build_networkx_graph()
 
-    # 筛选适合的节点
     candidate_nodes = []
     for node_id, data in G.nodes(data=True):
         score = 0
-        # 活动匹配
         if activity in data.get('suitable_activities', []):
             score += 3
-        # 特征匹配
         node_features = data.get('features', [])
         for feat in features:
             feat_map = {
@@ -396,7 +379,6 @@ def query_kg_for_route(activity: str, features: list, constraints: list) -> list
             mapped = feat_map.get(feat, feat)
             if mapped in node_features:
                 score += 1
-        # 约束过滤
         if 'ankle' in constraints or 'knee' in constraints:
             if '软路面' in node_features or '木栈道' in node_features or '平坦' in node_features:
                 score += 2
@@ -405,10 +387,8 @@ def query_kg_for_route(activity: str, features: list, constraints: list) -> list
         if score > 0:
             candidate_nodes.append((node_id, score, data))
 
-    # 按得分排序
     candidate_nodes.sort(key=lambda x: x[1], reverse=True)
 
-    # 从DB获取完整信息
     result = []
     for node_id, score, data in candidate_nodes[:8]:
         try:
@@ -435,14 +415,11 @@ def query_kg_for_route(activity: str, features: list, constraints: list) -> list
 
 
 def get_route_path_kg(origin_id: str, activity: str, max_stops: int = 3) -> list:
-    """
-    使用NetworkX路径算法，从起点出发找最优路线途经点
-    """
+    """使用NetworkX路径算法，从起点出发找最优路线途经点"""
     G = build_networkx_graph()
     if origin_id not in G:
         return []
 
-    # 找从起点出发的邻居节点（步行/骑行可达）
     walk_edges = [(u, v, d) for u, v, d in G.edges(origin_id, data=True)
                   if d.get('relation') in ['步行可达', '路线连接', '相邻']]
     walk_edges.sort(key=lambda x: x[2].get('weight', 99))

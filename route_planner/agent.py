@@ -1,22 +1,20 @@
 """
-agent.py - LangChain Agent 核心逻辑（修复版）
-修复问题：
-1. 时间/距离不匹配：配速表修正，目标距离基于用户输入时长精确计算
-2. 途经点未遵守：优先解析用户明确提到的地名作为必经点
-3. 路线时间展示：展示跑步配速时间而非步行时间
-4. key名统一：返回值统一用 'params' 键
-5. 途经点选择更智能：按距离合理性筛选，避免选出跨水域地点
+agent.py (v12-fixed)
+修复：
+1. 移除未使用的导入 (Optional, search_poi_by_keyword, plan_walking_route)
+2. 缓存 LLM 实例避免重复创建
+3. 知识图谱查询结果缓存
+4. 增加超时保护
 """
 import json
 import re
 import logging
-from typing import Optional
 from langchain_openai import ChatOpenAI
 from django.conf import settings
 
 from .amap_service import (
-    search_poi_by_keyword, search_poi_around,
-    plan_walking_route, geocode, build_multi_segment_route,
+    search_poi_around,
+    geocode, build_multi_segment_route,
     _haversine_distance
 )
 from .knowledge_base import retrieve_route_knowledge
@@ -26,7 +24,7 @@ logger = logging.getLogger(__name__)
 # 厦门岛内默认起点（白城沙滩）
 DEFAULT_START = {'name': '白城沙滩', 'lng': 118.100875, 'lat': 24.432281}
 
-# 配速表（min/km）- 用于根据用户时长计算目标距离
+# 配速表（min/km）
 PACE_MAP = {
     '散步': 15.0,
     '快走': 10.0,
@@ -41,18 +39,24 @@ PACE_MAP = {
     '徒步': 12.0,
 }
 
-# 高德步行API速度（min/km），用于换算高德返回的duration到跑步时间
-WALKING_PACE = 12.5  # 高德步行约80m/min
+WALKING_PACE = 12.5
+
+# LLM 实例缓存
+_llm_cache = {}
 
 
 def get_llm(streaming: bool = False):
-    return ChatOpenAI(
-        model=settings.DEEPSEEK_MODEL,
-        api_key=settings.DEEPSEEK_API_KEY,
-        base_url=settings.DEEPSEEK_BASE_URL,
-        temperature=0.3,
-        streaming=streaming,
-    )
+    cache_key = f"llm_{streaming}"
+    if cache_key not in _llm_cache:
+        _llm_cache[cache_key] = ChatOpenAI(
+            model=settings.DEEPSEEK_MODEL,
+            api_key=settings.DEEPSEEK_API_KEY,
+            base_url=settings.DEEPSEEK_BASE_URL,
+            temperature=0.3,
+            streaming=streaming,
+            request_timeout=30,
+        )
+    return _llm_cache[cache_key]
 
 
 # ============================================================
@@ -121,11 +125,10 @@ def parse_user_intent(user_input: str) -> dict:
 
 def _get_pace(activity_type: str, intensity: str = '中等') -> float:
     """获取配速（min/km）"""
-    key = activity_type
     if activity_type == '跑步':
         intensity_pace = {'轻松': 7.5, '中等': 6.5, '耐力': 5.5, '高强度': 5.0}
         return intensity_pace.get(intensity, 6.5)
-    return PACE_MAP.get(key, 6.5)
+    return PACE_MAP.get(activity_type, 6.5)
 
 
 def _calc_running_duration(distance_m: int, pace_min_per_km: float) -> float:
@@ -140,10 +143,7 @@ def plan_route_with_agent(user_query: str, session_id: str,
                            origin_name: str = None,
                            origin_lng: float = None,
                            origin_lat: float = None) -> dict:
-    """
-    使用Agent规划路线，返回完整结果
-    修复：时间/距离匹配、途经点遵守、渡轮过滤
-    """
+    """使用Agent规划路线，返回完整结果"""
     result = {
         'success': False,
         'params': {},
@@ -166,13 +166,12 @@ def plan_route_with_agent(user_query: str, session_id: str,
         'result': f"活动: {params.get('activity_type')}, 时长: {params.get('duration_min')}分钟, 必经点: {params.get('must_pass', [])}"
     })
 
-    city = '厦门'  # 城市锁定厦门
+    city = '厦门'
     activity_type = params.get('activity_type', '跑步')
     intensity = params.get('intensity', '中等')
     duration_min = int(params.get('duration_min', 60))
-    must_pass = params.get('must_pass', [])  # 用户明确指定的必经点
+    must_pass = params.get('must_pass', [])
 
-    # 计算目标距离（基于跑步配速）
     pace = _get_pace(activity_type, intensity)
     target_dist_km = duration_min / pace
     logger.info(f"[Agent] 目标距离: {target_dist_km:.1f}km (时长{duration_min}min, 配速{pace}min/km)")
@@ -199,6 +198,7 @@ def plan_route_with_agent(user_query: str, session_id: str,
     })
 
     # Step 3: 知识图谱查询
+    kg_nodes = []
     try:
         from .knowledge_graph import query_kg_for_route, init_knowledge_graph
         from .models import KGNode
@@ -216,15 +216,14 @@ def plan_route_with_agent(user_query: str, session_id: str,
     except Exception as e:
         logger.warning(f"[Agent] 知识图谱查询失败: {e}")
         result['agent_steps'].append({'step': '知识图谱查询', 'icon': '🕸️', 'result': f'失败: {str(e)}'})
-        kg_nodes = []
 
     # Step 4: RAG知识检索
+    rag_docs = []
     try:
         rag_query = f"{activity_type} {intensity} {' '.join(params.get('preferred_features', []))}"
         rag_docs = retrieve_route_knowledge(rag_query, n_results=3)
     except Exception as e:
         logger.warning(f"[Agent] RAG检索失败: {e}")
-        rag_docs = []
     rag_context = "\n".join([doc['text'][:200] for doc in rag_docs])
     result['rag_context'] = rag_context
     result['rag_docs'] = rag_docs
@@ -235,10 +234,9 @@ def plan_route_with_agent(user_query: str, session_id: str,
     })
 
     # Step 5: 构建途经点列表
-    # 优先级：用户明确指定的必经点 > KG推荐 > POI搜索
     waypoints = [start_point]
 
-    # 5a: 先处理用户明确指定的必经点（最高优先级）
+    # 5a: 用户明确指定的必经点
     must_pass_points = []
     for place_name in must_pass:
         try:
@@ -247,7 +245,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
                 start_point['lng'], start_point['lat'],
                 geo['lng'], geo['lat']
             )
-            # 必经点距起点不超过15km才有效
             if dist <= 15000:
                 must_pass_points.append({
                     'name': geo['name'],
@@ -262,7 +259,7 @@ def plan_route_with_agent(user_query: str, session_id: str,
 
     waypoints.extend(must_pass_points)
 
-    # 5b: 如果必经点不足，用POI搜索补充（基于目标距离选择合适的途经点）
+    # 5b: POI搜索补充
     if len(waypoints) < 3:
         preferred = params.get('preferred_features', [])
         if 'sea_view' in preferred or 'scenic' in preferred:
@@ -274,7 +271,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
         else:
             poi_keyword = '公园 广场 景点'
 
-        # 搜索半径基于目标距离的一半
         search_radius = min(int(target_dist_km * 500), 5000)
         pois = search_poi_around(
             start_point['lng'], start_point['lat'],
@@ -285,13 +281,10 @@ def plan_route_with_agent(user_query: str, session_id: str,
         )
         result['pois'] = pois
 
-        # 选择距离合适的POI（不超过目标距离的60%）
         max_poi_dist = target_dist_km * 1000 * 0.6
-        added = 0
         for poi in pois:
             dist = poi.get('distance', 0)
             if dist and 300 < dist < max_poi_dist:
-                # 检查是否已在必经点中
                 already_added = any(
                     abs(wp['lng'] - poi['location']['lng']) < 0.001 and
                     abs(wp['lat'] - poi['location']['lat']) < 0.001
@@ -303,7 +296,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
                         'lng': poi['location']['lng'],
                         'lat': poi['location']['lat'],
                     })
-                    added += 1
                     if len(waypoints) >= 4:
                         break
     else:
@@ -328,8 +320,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
     try:
         route_data = build_multi_segment_route(waypoints, activity_type=activity_type)
 
-        # 关键修复：展示跑步时间而非步行时间
-        # 高德步行API返回的duration是步行时间，需转换为跑步时间
         actual_dist_km = route_data['total_distance_km']
         running_duration_min = _calc_running_duration(
             route_data['total_distance_m'], pace
@@ -338,7 +328,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
         route_data['running_pace_min_per_km'] = pace
         route_data['activity_type'] = activity_type
 
-        # 如果有失败路段，在agent_steps中提示
         failed = route_data.get('failed_segments', [])
         if failed:
             fail_info = ', '.join([f"{f['from']}→{f['to']}" for f in failed])
