@@ -350,31 +350,22 @@ def plan_route_with_agent(user_query: str, session_id: str,
         result['error'] = str(e)
         return result
 
-    # Step 7: 生成AI推荐语
+    # Step 7: 生成推荐语（使用模板生成，避免额外 LLM 调用延迟）
     try:
         route_info = result.get('route', {})
         dist_km = route_info.get('total_distance_km', 0)
         dur_min = route_info.get('total_duration_min', duration_min)
         wp_names = ' → '.join([w['name'] for w in waypoints])
-        kg_hint = ''
-        if kg_nodes:
-            kg_hint = f"知识图谱推荐特征：{', '.join(kg_nodes[0].get('features', [])[:3])}"
-
-        rec_prompt = f"""请为以下厦门运动路线生成一段简洁有感染力的推荐语（80字以内）：
-用户需求：{user_query}
-路线：{wp_names}
-距离：{dist_km}km，预计{dur_min}分钟
-活动类型：{activity_type}
-{kg_hint}
-相关知识：{rag_context[:150] if rag_context else '厦门特色路线'}
-
-直接给出推荐语，不要有前缀。"""
-
-        llm = get_llm()
-        rec_response = llm.invoke(rec_prompt)
-        result['recommendation'] = rec_response.content.strip()
+        
+        # 直接用模板生成推荐语，省去 5 秒 LLM 调用
+        mid_points = [w['name'] for w in waypoints[1:-1]]
+        if mid_points:
+            via_text = f"，途经{'、'.join(mid_points[:3])}"
+        else:
+            via_text = ''
+        result['recommendation'] = f"为您规划了一条{dist_km}km的{activity_type}路线{via_text}，预计{dur_min}分钟完成。祝运动愉快！"
         result['agent_steps'].append({
-            'step': 'AI推荐语生成',
+            'step': '推荐语生成',
             'icon': '✨',
             'result': result['recommendation'][:50] + '...'
         })

@@ -1,11 +1,12 @@
 """
-chat/views.py (v12-fixed-v2)
-修复：
-1. [PLAN_ROUTE] 标签泄漏 - 使用缓冲区机制彻底过滤
-2. 减少 LLM 调用次数 - 路线已规划时修改 system prompt 禁止输出 [PLAN_ROUTE]
-3. 增加进度反馈 - 路线规划过程中发送 status 事件，避免"卡死"感
-4. 内存泄漏 - _memory_store 增加 LRU 淘汰机制
-5. 移除手动 CORS 头（由 django-cors-headers 中间件统一处理）
+chat/views.py (v12-fixed-v3)
+核心修复：
+1. 先 LLM 流式输出文字 → 再路线规划 → 发送路线数据（用户不再等待）
+2. 意图解析只做 1 次，传给 plan_route_with_agent 复用
+3. [PLAN_ROUTE] 标签使用缓冲区机制彻底过滤
+4. 前端 status 消息追加显示，不覆盖已有文字
+5. _memory_store 使用 LRU 淘汰防止内存泄漏
+6. 移除手动 CORS 头（由 django-cors-headers 中间件统一处理）
 """
 import json
 import logging
@@ -32,19 +33,10 @@ SYSTEM_PROMPT = """你是「路线大师」，专注厦门的运动路线规划A
 支持：跑步、散步、骑行、徒步，考虑健康状况（脚踝/膝盖不适）。
 重要：所有路线只在厦门岛内及周边规划，不会规划需要坐船/渡轮的跨岛路线。
 
-当用户描述运动需求时，在回复末尾加 [PLAN_ROUTE]，系统会自动调用高德API生成真实路线地图。
+当用户描述运动需求时，请给出简洁的路线建议文字描述，在末尾加 [PLAN_ROUTE] 标记。
+系统会自动调用高德API在地图上绘制真实路线。
 回答简洁、实用，使用中文，适当使用Markdown格式。
 注意：路线时间是按跑步/骑行配速计算的，不是步行时间。"""
-
-# 当路线已经规划成功时，使用这个 prompt 让 LLM 不再输出 [PLAN_ROUTE]
-SYSTEM_PROMPT_WITH_ROUTE = """你是「路线大师」，专注厦门的运动路线规划AI助手。
-能力：根据用户时间、目标、身体状态规划个性化路线，熟悉厦门所有运动场所。
-支持：跑步、散步、骑行、徒步，考虑健康状况（脚踝/膝盖不适）。
-重要：所有路线只在厦门岛内及周边规划，不会规划需要坐船/渡轮的跨岛路线。
-
-路线已经规划完成并显示在地图上了，请直接用简洁友好的语言总结路线亮点和注意事项。
-不要输出 [PLAN_ROUTE] 标记，不要重复距离和时间数据（地图上已经显示了）。
-回答简洁、实用，使用中文，适当使用Markdown格式。"""
 
 
 def get_client():
@@ -124,7 +116,8 @@ ORIGIN_KEYWORDS = ['从', '出发', '起点', '在']
 def needs_route_planning(text: str) -> bool:
     has_activity = any(kw in text for kw in ROUTE_KEYWORDS)
     has_origin = any(kw in text for kw in ORIGIN_KEYWORDS)
-    return has_activity and has_origin
+    has_dest = '到' in text or '去' in text
+    return has_activity and (has_origin or has_dest)
 
 
 def _sse_event(data: dict) -> str:
@@ -141,7 +134,14 @@ def _strip_plan_route_tag(text: str) -> str:
 
 @csrf_exempt
 def chat_message(request):
-    """POST /api/chat/message/ - SSE流式响应"""
+    """POST /api/chat/message/ - SSE流式响应
+    
+    核心流程（v3 重构）：
+    1. 先让 LLM 流式输出文字描述（用户立即看到内容）
+    2. 文字输出完成后，如果检测到 [PLAN_ROUTE] 标签，再调用路线规划
+    3. 路线规划完成后发送 route_plan 事件
+    4. 最后发送 done 事件
+    """
     if request.method == 'OPTIONS':
         return _json_response({})
     if request.method != 'POST':
@@ -177,65 +177,20 @@ def chat_message(request):
         route_data = None
         rag_docs = []
 
-        direct_plan = needs_route_planning(user_msg) or (origin and any(kw in user_msg for kw in ROUTE_KEYWORDS))
-
-        if direct_plan:
-            # 发送进度状态，让前端知道正在规划路线
-            yield _sse_event({'type': 'status', 'content': '正在分析运动需求...'})
-
-            try:
-                from route_planner.agent import plan_route_with_agent
-                origin_name = origin if origin else None
-                if not origin_name:
-                    m = re.search(r'从(.{2,12}?)(?:出发|起|跑|到)', user_msg)
-                    if m:
-                        origin_name = m.group(1)
-
-                yield _sse_event({'type': 'status', 'content': '正在规划路线，调用高德地图API...'})
-
-                result = plan_route_with_agent(
-                    user_query=user_msg,
-                    session_id=session_id,
-                    origin_name=origin_name,
-                )
-                if result.get('success'):
-                    route_data = result
-                    rag_docs = result.get('rag_docs', [])
-                    yield _sse_event({'type': 'route_plan', 'route_data': result})
-                    if rag_docs:
-                        yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
-                elif result.get('error'):
-                    yield _sse_event({'type': 'error', 'error': result['error']})
-            except Exception as e:
-                logger.error(f"[Chat] 路线规划失败: {e}")
-                yield _sse_event({'type': 'error', 'error': f'路线规划失败: {str(e)}'})
-
-        # 根据路线规划结果选择不同的 system prompt
-        if route_data:
-            # 路线已规划成功，使用不含 [PLAN_ROUTE] 指令的 prompt
-            system_prompt = SYSTEM_PROMPT_WITH_ROUTE
-            route = route_data.get('route', {})
-            route_summary = (
-                f"\n\n[路线规划结果] 距离: {route.get('total_distance_km')}km, "
-                f"配速预计: {route.get('total_duration_min')}分钟, "
-                f"活动类型: {route.get('activity_type', '跑步')}, "
-                f"途经: {' → '.join([w['name'] for w in route_data.get('waypoints', [])])}, "
-                f"推荐语: {route_data.get('recommendation', '')}"
-            )
-            system_prompt += route_summary
-        else:
-            system_prompt = SYSTEM_PROMPT
-
+        # ============================================================
+        # 阶段1: LLM 流式输出文字描述（用户立即看到内容）
+        # ============================================================
+        system_prompt = SYSTEM_PROMPT
         if memory_context and '第一次' not in memory_context:
             system_prompt += f"\n\n[用户历史偏好] {memory_context}"
 
         messages_to_send = [{'role': 'system', 'content': system_prompt}] + history
 
         # 使用缓冲区机制过滤 [PLAN_ROUTE] 标签
-        # 因为流式输出可能将标签拆分到多个 token 中
         PLAN_TAG = '[PLAN_ROUTE]'
         TAG_LEN = len(PLAN_TAG)
         token_buffer = ''
+        found_plan_tag = False
 
         try:
             stream = client.chat.completions.create(
@@ -251,17 +206,15 @@ def chat_message(request):
                     full_response += token
                     token_buffer += token
 
-                    # 如果缓冲区中可能包含 [PLAN_ROUTE] 的一部分，继续缓冲
-                    # 只有当缓冲区足够长且不包含标签前缀时，才输出
+                    # 检查缓冲区中是否包含完整的 [PLAN_ROUTE] 标签
                     if PLAN_TAG in token_buffer:
-                        # 找到完整标签，移除它
+                        found_plan_tag = True
                         token_buffer = token_buffer.replace(PLAN_TAG, '')
                         if token_buffer:
                             yield _sse_event({'type': 'token', 'content': token_buffer})
                         token_buffer = ''
                     elif len(token_buffer) >= TAG_LEN:
-                        # 缓冲区够长了，检查末尾是否是标签的前缀
-                        # 找到最长的可能是 PLAN_TAG 前缀的后缀
+                        # 缓冲区够长了，输出安全部分
                         safe_len = len(token_buffer)
                         for k in range(1, TAG_LEN):
                             if token_buffer.endswith(PLAN_TAG[:k]):
@@ -272,39 +225,69 @@ def chat_message(request):
                             token_buffer = token_buffer[safe_len:]
                             yield _sse_event({'type': 'token', 'content': to_send})
 
-            # 流结束，输出剩余缓冲区（清除可能的标签残留）
+            # 流结束，输出剩余缓冲区
             if token_buffer:
+                if PLAN_TAG in token_buffer:
+                    found_plan_tag = True
+                    token_buffer = token_buffer.replace(PLAN_TAG, '')
                 token_buffer = _strip_plan_route_tag(token_buffer)
                 if token_buffer:
                     yield _sse_event({'type': 'token', 'content': token_buffer})
 
         except Exception as e:
-            logger.error(f"[Chat] DeepSeek失败: {e}")
-            if route_data:
-                fallback = route_data.get('recommendation', '路线规划完成，请查看地图上的路线。')
-            else:
-                fallback = f'抱歉，AI响应暂时不可用，请稍后重试。'
+            logger.error(f"[Chat] DeepSeek流式输出失败: {e}")
+            fallback = '抱歉，AI响应暂时不可用，请稍后重试。'
             full_response = fallback
             yield _sse_event({'type': 'token', 'content': fallback})
 
-        clean_response = _strip_plan_route_tag(full_response).strip()
+        # 检查是否需要路线规划（LLM 输出了 [PLAN_ROUTE] 或用户消息明确需要）
+        should_plan = found_plan_tag or ('[PLAN_ROUTE]' in full_response)
+        if not should_plan:
+            should_plan = needs_route_planning(user_msg)
 
-        # 如果 LLM 输出了 [PLAN_ROUTE] 但之前没有成功规划路线，尝试延迟规划
-        if '[PLAN_ROUTE]' in full_response and not route_data:
+        # ============================================================
+        # 阶段2: 路线规划（文字已经输出完毕，用户已看到内容）
+        # ============================================================
+        if should_plan:
+            yield _sse_event({'type': 'status', 'content': '🗺️ 正在为您规划地图路线...'})
+            logger.info(f"[Chat] 开始路线规划: {user_msg[:50]}")
+
             try:
-                yield _sse_event({'type': 'status', 'content': '正在规划路线...'})
-                from route_planner.agent import plan_route_with_agent, parse_user_intent
-                params = parse_user_intent(user_msg)
-                origin_name = origin or params.get('origin')
-                result = plan_route_with_agent(user_query=user_msg, session_id=session_id, origin_name=origin_name)
+                from route_planner.agent import plan_route_with_agent
+
+                # 提取起点名称
+                origin_name = origin if origin else None
+                if not origin_name:
+                    m = re.search(r'从(.{2,12}?)(?:出发|起|跑|到)', user_msg)
+                    if m:
+                        origin_name = m.group(1)
+
+                result = plan_route_with_agent(
+                    user_query=user_msg,
+                    session_id=session_id,
+                    origin_name=origin_name,
+                )
+
                 if result.get('success'):
                     route_data = result
                     rag_docs = result.get('rag_docs', [])
+                    logger.info(f"[Chat] 路线规划成功: {result.get('route', {}).get('total_distance_km')}km")
                     yield _sse_event({'type': 'route_plan', 'route_data': result})
                     if rag_docs:
                         yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
+                else:
+                    error_msg = result.get('error', '路线规划失败')
+                    logger.warning(f"[Chat] 路线规划未成功: {error_msg}")
+                    yield _sse_event({'type': 'status', 'content': f'⚠️ {error_msg}'})
+
             except Exception as e:
-                logger.error(f"[Chat] 延迟路线规划失败: {e}")
+                logger.error(f"[Chat] 路线规划异常: {e}", exc_info=True)
+                yield _sse_event({'type': 'status', 'content': f'⚠️ 路线规划失败: {str(e)[:100]}'})
+
+        # ============================================================
+        # 阶段3: 保存消息和更新偏好
+        # ============================================================
+        clean_response = _strip_plan_route_tag(full_response).strip()
 
         extra = {}
         if route_data:

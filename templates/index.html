@@ -379,6 +379,11 @@ html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSys
               <div class="avatar" :class="msg.role">{{ msg.role==='user'?'你':'🤖' }}</div>
               <div class="bubble-wrap">
                 <div class="bubble" :class="msg.role" v-html="renderMd(msg.content)"></div>
+                <!-- 路线规划进度提示 -->
+                <div v-if="msg.statusText" style="padding:6px 10px;margin-top:4px;font-size:12px;color:var(--primary);background:var(--primary-light);border-radius:8px;display:flex;align-items:center;gap:6px;">
+                  <span class="typing-dots"><span>.</span><span>.</span><span>.</span></span>
+                  {{ msg.statusText }}
+                </div>
 
                 <!-- RAG知识片段 -->
                 <div v-if="msg.ragDocs&&msg.ragDocs.length>0" class="rag-panel">
@@ -738,8 +743,14 @@ createApp({
               } else if (ev.type === 'rag_context') {
                 messages.value[aiIdx].ragDocs = ev.docs || [];
               } else if (ev.type === 'status') {
-                // 显示进度状态（如"正在规划路线..."）
-                messages.value[aiIdx].content = `⏳ ${ev.content}`;
+                // 显示进度状态 - 不覆盖已有文字，追加到末尾
+                if (messages.value[aiIdx].content && messages.value[aiIdx].content.trim()) {
+                  // 已有文字内容，在末尾追加状态提示
+                  messages.value[aiIdx].statusText = ev.content;
+                } else {
+                  // 还没有文字内容，直接显示状态
+                  messages.value[aiIdx].content = `⏳ ${ev.content}`;
+                }
                 scrollBottom();
               } else if (ev.type === 'error') {
                 messages.value[aiIdx].content += `\n\n❌ ${ev.error}`;
@@ -754,14 +765,15 @@ createApp({
         // 最终清理：移除可能残留的 [PLAN_ROUTE] 和状态前缀
         let finalContent = messages.value[aiIdx].content;
         finalContent = finalContent.replace(/\[PLAN_ROUTE\]/g, '').replace(/\[PLAN_?ROUTE?\]?/g, '');
-        // 如果内容以状态提示开头且后面有实际内容，移除状态提示
-        if (finalContent.startsWith('⏳') && finalContent.includes('\n')) {
-          finalContent = finalContent.replace(/^⏳[^\n]*\n?/, '');
-        } else if (finalContent.startsWith('⏳') && messages.value[aiIdx].routeData) {
-          // 路线已规划但只有状态文字，替换为默认提示
+        // 清除状态提示前缀
+        finalContent = finalContent.replace(/^⏳[^\n]*\n?/, '');
+        if (!finalContent.trim() && messages.value[aiIdx].routeData) {
+          // 路线已规划但没有文字内容，显示默认提示
           finalContent = '路线已规划完成，请查看地图和下方路线卡片 👇';
         }
         messages.value[aiIdx].content = finalContent.trim();
+        // 清除状态文字
+        messages.value[aiIdx].statusText = '';
 
       } catch(e) {
         isTyping.value = false;
