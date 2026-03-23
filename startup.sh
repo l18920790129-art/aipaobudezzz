@@ -2,10 +2,10 @@
 set -e
 echo "=== 运动智能伴侣 · 路线大师 启动中 ==="
 
-# Railway 动态注入 PORT 环境变量，需要在运行时读取
-# 如果 PORT 未设置，使用默认值 8080
+# Railway/Render 动态注入 PORT 环境变量
+# Render 免费版默认使用 10000 端口
 if [ -z "$PORT" ]; then
-    export PORT=8080
+    export PORT=10000
 fi
 echo ">>> 监听端口: $PORT"
 
@@ -29,7 +29,7 @@ else:
 echo ">>> 启动 Gunicorn on 0.0.0.0:$PORT ..."
 exec gunicorn config.wsgi:application \
     --bind "0.0.0.0:$PORT" \
-    --workers 2 \
+    --workers 1 \
     --timeout 180 \
     --log-level info \
     --access-logfile -

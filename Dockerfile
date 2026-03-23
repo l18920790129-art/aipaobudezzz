@@ -19,8 +19,8 @@ COPY . .
 # 收集静态文件（忽略错误）
 RUN python manage.py collectstatic --noinput || true
 
-# 暴露端口（Railway使用PORT环境变量动态分配）
-EXPOSE 8080
+# 暴露端口（Render/Railway 使用 PORT 环境变量动态分配）
+EXPOSE 10000
 
 # 确保startup.sh有执行权限
 RUN chmod +x startup.sh

@@ -1,0 +1,29 @@
+databases:
+  - name: aipaobu-db
+    plan: free
+    databaseName: sports_db
+    user: sports_user
+
+services:
+  - type: web
+    name: aipaobudezzz
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: aipaobu-db
+          property: connectionString
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: AMAP_WEB_KEY
+        value: 29b9bdb25de113178710004b939bbd58
+      - key: AMAP_JS_KEY
+        value: 213a968a1964c78c07a2883e9590820b
+      - key: DEEPSEEK_API_KEY
+        value: sk-196ac58ce714488bb5044394cdb96f65
+      - key: DEBUG
+        value: "False"
+      - key: PORT
+        value: "8080"
