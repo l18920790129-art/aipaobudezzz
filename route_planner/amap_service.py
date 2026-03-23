@@ -1,11 +1,9 @@
 """
 amap_service.py - 高德地图 API 真实调用模块
-功能：
-1. POI搜索（关键字搜索 + 周边搜索）
-2. 步行路径规划
-3. 骑行路径规划
-4. 地理编码（地址转坐标）
-5. GCJ-02 → WGS84 坐标转换
+修复：
+1. 过滤渡轮/轮渡路段（禁止坐船路线混入跑步路线）
+2. 禁止直线降级连接（直线会穿越水域/建筑）
+3. 步行路线严格过滤非步行路段
 """
 import math
 import logging
@@ -17,10 +15,9 @@ logger = logging.getLogger(__name__)
 AMAP_KEY = settings.AMAP_WEB_KEY
 AMAP_BASE = 'https://restapi.amap.com'
 
+FERRY_KEYWORDS = ['轮渡', '渡轮', '渡口', '轮船', '坐船', '乘船', '摆渡', 'ferry']
 
-# ============================================================
-# 坐标转换：GCJ-02 → WGS84
-# ============================================================
+
 def _transform_lat(x, y):
     ret = -100.0 + 2.0*x + 3.0*y + 0.2*y*y + 0.1*x*y + 0.2*math.sqrt(abs(x))
     ret += (20.0*math.sin(6.0*x*math.pi) + 20.0*math.sin(2.0*x*math.pi)) * 2.0/3.0
@@ -38,7 +35,6 @@ def _transform_lon(x, y):
 
 
 def gcj02_to_wgs84(gcj_lat: float, gcj_lon: float) -> tuple:
-    """高德GCJ-02坐标转WGS84坐标"""
     a = 6378245.0
     ee = 0.00669342162296594323
     x = gcj_lon - 105.0
@@ -54,27 +50,35 @@ def gcj02_to_wgs84(gcj_lat: float, gcj_lon: float) -> tuple:
     return round(gcj_lat - d_lat, 6), round(gcj_lon - d_lon, 6)
 
 
-# ============================================================
-# 地理编码：地址/地名 → GCJ-02坐标
-# ============================================================
+def _haversine_distance(lng1, lat1, lng2, lat2) -> float:
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def _contains_ferry(steps: list) -> bool:
+    for step in steps:
+        instruction = step.get('instruction', '') or ''
+        road = step.get('road', '') or ''
+        action = step.get('action', '') or ''
+        text = instruction + road + action
+        for kw in FERRY_KEYWORDS:
+            if kw in text:
+                return True
+    return False
+
+
 def geocode(address: str, city: str = '厦门') -> dict:
-    """
-    地理编码：将地址/地名转换为GCJ-02坐标
-    返回: {'name': str, 'lng': float, 'lat': float, 'formatted_address': str}
-    """
     url = f"{AMAP_BASE}/v3/geocode/geo"
-    params = {
-        'key': AMAP_KEY,
-        'address': address,
-        'city': city,
-        'output': 'JSON',
-    }
+    params = {'key': AMAP_KEY, 'address': address, 'city': city, 'output': 'JSON'}
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         logger.info(f"[高德地理编码] 查询: {address}, 状态: {data.get('status')}")
-
         if data.get('status') == '1' and data.get('geocodes'):
             geo = data['geocodes'][0]
             location = geo.get('location', '')
@@ -93,40 +97,23 @@ def geocode(address: str, city: str = '厦门') -> dict:
         raise
 
 
-# ============================================================
-# POI搜索：关键字搜索
-# ============================================================
 def search_poi_by_keyword(keyword: str, city: str = '厦门',
                            poi_types: str = '', page: int = 1,
                            page_size: int = 10) -> list:
-    """
-    高德POI关键字搜索
-    返回: [{'poi_id', 'name', 'address', 'category', 'location': {'lng', 'lat'}, 'tel'}, ...]
-    """
     url = f"{AMAP_BASE}/v3/place/text"
     params = {
-        'key': AMAP_KEY,
-        'keywords': keyword,
-        'city': city,
-        'citylimit': 'true',
-        'output': 'JSON',
-        'offset': page_size,
-        'page': page,
-        'extensions': 'base',
+        'key': AMAP_KEY, 'keywords': keyword, 'city': city,
+        'citylimit': 'true', 'output': 'JSON',
+        'offset': page_size, 'page': page, 'extensions': 'base',
     }
     if poi_types:
         params['types'] = poi_types
-
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德POI搜索] 关键词: {keyword}, 城市: {city}, 结果数: {data.get('count', 0)}")
-
         if data.get('status') != '1':
-            logger.warning(f"[高德POI搜索] 失败: {data.get('info')}")
             return []
-
         pois = []
         for p in data.get('pois', []):
             location = p.get('location', '')
@@ -148,44 +135,28 @@ def search_poi_by_keyword(keyword: str, city: str = '厦门',
         return []
 
 
-# ============================================================
-# POI搜索：周边搜索
-# ============================================================
 def search_poi_around(center_lng: float, center_lat: float,
                        radius: int = 3000, keyword: str = '',
                        poi_types: str = '', city: str = '厦门',
                        page_size: int = 10) -> list:
-    """
-    高德POI周边搜索
-    center_lng/lat: GCJ-02坐标
-    radius: 搜索半径（米）
-    """
     url = f"{AMAP_BASE}/v3/place/around"
     params = {
         'key': AMAP_KEY,
         'location': f"{center_lng},{center_lat}",
-        'radius': radius,
-        'output': 'JSON',
-        'offset': page_size,
-        'page': 1,
-        'extensions': 'base',
-        'sortrule': 'distance',
+        'radius': radius, 'output': 'JSON',
+        'offset': page_size, 'page': 1,
+        'extensions': 'base', 'sortrule': 'distance',
     }
     if keyword:
         params['keywords'] = keyword
     if poi_types:
         params['types'] = poi_types
-
     try:
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德周边搜索] 中心: ({center_lng},{center_lat}), 半径: {radius}m, 关键词: {keyword}")
-
         if data.get('status') != '1':
-            logger.warning(f"[高德周边搜索] 失败: {data.get('info')}")
             return []
-
         pois = []
         for p in data.get('pois', []):
             location = p.get('location', '')
@@ -207,20 +178,12 @@ def search_poi_around(center_lng: float, center_lat: float,
         return []
 
 
-# ============================================================
-# 步行路径规划
-# ============================================================
 def plan_walking_route(origin_lng: float, origin_lat: float,
-                        dest_lng: float, dest_lat: float) -> dict:
+                        dest_lng: float, dest_lat: float,
+                        reject_ferry: bool = True) -> dict:
     """
     高德步行路径规划 v3
-    origin/dest: GCJ-02坐标
-    返回: {
-        'distance': int,  # 总距离（米）
-        'duration': int,  # 总时间（秒）
-        'steps': [...],   # 路段列表
-        'polyline': [(lng, lat), ...],  # GCJ-02路线坐标点
-    }
+    reject_ferry=True 时若检测到渡轮路段则抛出异常
     """
     url = f"{AMAP_BASE}/v3/direction/walking"
     params = {
@@ -233,7 +196,7 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德步行规划] {origin_lng},{origin_lat} → {dest_lng},{dest_lat}, 状态: {data.get('status')}")
+        logger.info(f"[高德步行规划] {origin_lng},{origin_lat} -> {dest_lng},{dest_lat}, 状态: {data.get('status')}")
 
         if data.get('status') != '1':
             raise ValueError(f"步行路径规划失败: {data.get('info', '未知错误')}")
@@ -246,7 +209,10 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
         path = paths[0]
         steps = path.get('steps', [])
 
-        # 提取所有坐标点（GCJ-02）
+        # 关键修复：检测并拒绝渡轮路段
+        if reject_ferry and _contains_ferry(steps):
+            raise ValueError("路线包含渡轮/轮渡路段，两点之间有水域阻隔，请选择同一陆地区域内的途经点")
+
         all_points = []
         step_list = []
         for step in steps:
@@ -256,7 +222,6 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
                     if ',' in point_str:
                         lng_s, lat_s = point_str.split(',')
                         all_points.append((float(lng_s), float(lat_s)))
-
             step_list.append({
                 'instruction': step.get('instruction', ''),
                 'distance': int(step.get('distance', 0)),
@@ -269,21 +234,15 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
             'distance': int(path.get('distance', 0)),
             'duration': int(path.get('duration', 0)),
             'steps': step_list,
-            'polyline': all_points,  # GCJ-02坐标列表
+            'polyline': all_points,
         }
     except requests.RequestException as e:
         logger.error(f"[高德步行规划] 网络错误: {e}")
         raise
 
 
-# ============================================================
-# 骑行路径规划
-# ============================================================
 def plan_cycling_route(origin_lng: float, origin_lat: float,
                         dest_lng: float, dest_lat: float) -> dict:
-    """
-    高德骑行路径规划 v4
-    """
     url = f"{AMAP_BASE}/v4/direction/bicycling"
     params = {
         'key': AMAP_KEY,
@@ -295,17 +254,12 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德骑行规划] 状态: {data.get('errcode', data.get('status'))}")
-
-        # 骑行API返回格式略有不同
         if data.get('errcode') != 0 and data.get('status') != '1':
             raise ValueError(f"骑行路径规划失败: {data.get('errmsg', data.get('info', '未知错误'))}")
-
         route = data.get('data', data.get('route', {}))
         paths = route.get('paths', [])
         if not paths:
             raise ValueError("骑行路径规划返回空路径")
-
         path = paths[0]
         steps = path.get('steps', [])
         all_points = []
@@ -323,7 +277,6 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
                 'duration': int(step.get('duration', 0)),
                 'road': step.get('road', ''),
             })
-
         return {
             'distance': int(path.get('distance', 0)),
             'duration': int(path.get('duration', 0)),
@@ -335,14 +288,10 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
         raise
 
 
-# ============================================================
-# 构建完整路线（起点 → 途经点 → 终点）
-# ============================================================
 def build_multi_segment_route(waypoints: list, activity_type: str = '步行') -> dict:
     """
-    多段路线规划：将多个途经点连接成完整路线
-    waypoints: [{'name': str, 'lng': float, 'lat': float}, ...]  GCJ-02坐标
-    返回完整路线信息
+    多段路线规划
+    修复：禁止直线降级连接（原代码在失败时用直线连接导致穿越水域/建筑）
     """
     if len(waypoints) < 2:
         raise ValueError("至少需要2个途经点")
@@ -351,10 +300,25 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
     total_distance = 0
     total_duration = 0
     segment_details = []
+    failed_segments = []
 
     for i in range(len(waypoints) - 1):
         origin = waypoints[i]
         dest = waypoints[i + 1]
+
+        # 检查直线距离，超过15km在厦门岛内不合理
+        straight_dist = _haversine_distance(
+            origin['lng'], origin['lat'],
+            dest['lng'], dest['lat']
+        )
+        if straight_dist > 15000:
+            logger.warning(f"[多段路线] 第{i+1}段直线距离{straight_dist:.0f}m过远，跳过")
+            failed_segments.append({
+                'from': origin['name'],
+                'to': dest['name'],
+                'reason': f"两点距离{straight_dist/1000:.1f}km过远，超出合理范围"
+            })
+            continue
 
         try:
             if activity_type in ['骑行']:
@@ -365,7 +329,8 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
             else:
                 seg = plan_walking_route(
                     origin['lng'], origin['lat'],
-                    dest['lng'], dest['lat']
+                    dest['lng'], dest['lat'],
+                    reject_ferry=True
                 )
 
             all_polyline.extend(seg['polyline'])
@@ -376,20 +341,30 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
                 'to': dest['name'],
                 'distance': seg['distance'],
                 'duration': seg['duration'],
-                'steps': seg['steps'][:3],  # 只保留前3步
+                'steps': seg['steps'][:3],
             })
+            logger.info(f"[多段路线] 第{i+1}段成功: {origin['name']} -> {dest['name']}, {seg['distance']}m")
+
         except Exception as e:
-            logger.warning(f"[多段路线] 第{i+1}段规划失败: {e}")
-            # 用直线连接作为降级
-            all_polyline.append((origin['lng'], origin['lat']))
-            all_polyline.append((dest['lng'], dest['lat']))
+            # 关键修复：不再用直线连接，直接跳过失败路段
+            logger.warning(f"[多段路线] 第{i+1}段跳过({e}): {origin['name']} -> {dest['name']}")
+            failed_segments.append({
+                'from': origin['name'],
+                'to': dest['name'],
+                'reason': str(e)
+            })
+
+    if not segment_details:
+        reasons = '; '.join([f['reason'] for f in failed_segments])
+        raise ValueError(f"所有路段规划均失败，请重新选择途经点。原因：{reasons}")
 
     return {
         'total_distance_m': total_distance,
         'total_duration_s': total_duration,
         'total_distance_km': round(total_distance / 1000, 2),
         'total_duration_min': round(total_duration / 60, 1),
-        'polyline': all_polyline,  # GCJ-02坐标列表
+        'polyline': all_polyline,
         'waypoints': waypoints,
         'segment_details': segment_details,
+        'failed_segments': failed_segments,
     }

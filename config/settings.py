@@ -80,7 +80,12 @@ USE_TZ = True
 
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+# Django 5.x 使用 STORAGES 替代已弃用的 STATICFILES_STORAGE
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -102,3 +107,29 @@ CHROMA_PERSIST_DIR = os.environ.get('CHROMA_PERSIST_DIR', str(BASE_DIR / 'chroma
 # ===== 默认城市 =====
 DEFAULT_CITY = '厦门'
 DEFAULT_CITY_ADCODE = '350200'
+
+# ===== 日志配置 =====
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '[{asctime}] {levelname} {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'route_planner': {'level': 'INFO', 'handlers': ['console'], 'propagate': False},
+        'chat': {'level': 'INFO', 'handlers': ['console'], 'propagate': False},
+    },
+}

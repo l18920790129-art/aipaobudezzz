@@ -326,6 +326,7 @@ html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSys
       <div class="map-route-info" :class="{show:currentRoute}">
         <div class="ri-stat"><div class="v">{{ currentRoute?.route?.total_distance_km }}</div><div class="l">公里</div></div>
         <div class="ri-stat"><div class="v">{{ currentRoute?.route?.total_duration_min }}</div><div class="l">分钟</div></div>
+        <div class="ri-stat"><div class="v">{{ (currentRoute?.waypoints||[]).length }}</div><div class="l">途经点</div></div>
         <div class="ri-waypoints">
           <template v-for="(wp,wi) in (currentRoute?.waypoints||[])" :key="wi">
             <span class="ri-wp">{{ wp.name }}</span>
@@ -381,7 +382,7 @@ html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSys
 
                 <!-- RAG知识片段 -->
                 <div v-if="msg.ragDocs&&msg.ragDocs.length>0" class="rag-panel">
-                  <div class="rag-title">📚 RAG 知识检索（{{ msg.ragDocs.length }} 条）</div>
+                  <div class="rag-title">📚 知识库检索（{{ msg.ragDocs.length }} 条）</div>
                   <div v-for="(doc,di) in msg.ragDocs.slice(0,2)" :key="di" class="rag-item">
                     <strong>{{ doc.metadata?.area||'厦门' }}</strong>：{{ doc.text?doc.text.slice(0,90)+'...':'' }}
                   </div>
@@ -403,6 +404,18 @@ html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSys
                       </div>
                     </div>
                     <div v-if="msg.routeData.recommendation" class="rc-rec">💡 {{ msg.routeData.recommendation }}</div>
+                    <!-- 失败路段警告 -->
+                    <div v-if="msg.routeData.route?.failed_segments?.length>0" style="padding:6px 8px;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;margin-bottom:8px;font-size:11px;color:#991b1b;">
+                      ⚠️ 以下路段因水域阻隔已跳过：
+                      <span v-for="(fs,fi) in msg.routeData.route.failed_segments" :key="fi">
+                        {{ fs.from }}→{{ fs.to }}<span v-if="fi<msg.routeData.route.failed_segments.length-1">、</span>
+                      </span>
+                    </div>
+                    <!-- 配速信息 -->
+                    <div v-if="msg.routeData.route?.running_pace_min_per_km" style="font-size:11px;color:var(--muted);margin-bottom:8px;">
+                      ⏱️ 配速：{{ msg.routeData.route.running_pace_min_per_km }} 分钟/公里
+                      <span v-if="msg.routeData.route.activity_type">（{{ msg.routeData.route.activity_type }}）</span>
+                    </div>
                     <button class="view-btn" @click="showRoute(msg.routeData)">📍 在地图上查看路线</button>
                   </div>
                 </div>
@@ -410,7 +423,7 @@ html,body,#app{height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSys
                 <!-- Agent步骤 -->
                 <div v-if="msg.agentSteps&&msg.agentSteps.length>0" class="agent-panel">
                   <div class="agent-title" @click="msg.showSteps=!msg.showSteps">
-                    ⚙️ Agent 推理（{{ msg.agentSteps.length }} 步）{{ msg.showSteps?'▲':'▼' }}
+                    ⚙️ 智能推理（{{ msg.agentSteps.length }} 步）{{ msg.showSteps?'▲':'▼' }}
                   </div>
                   <template v-if="msg.showSteps">
                     <div v-for="(st,si) in msg.agentSteps" :key="si" class="agent-step">
