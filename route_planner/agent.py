@@ -1,12 +1,13 @@
 """
-agent.py (v12-fix-v4)
-修复地图不画线的核心 Bug：
-1. 每个步骤添加 try/except + 详细日志，确保不会静默卡死
-2. 意图解析增加超时保护（25秒）
-3. 知识图谱查询增加超时保护，不再在请求中初始化（避免与 startup.sh 竞争）
-4. RAG 检索增加超时保护
-5. build_multi_segment_route 增加超时保护（60秒）
-6. 所有异常都正确传播，不再静默吞掉
+agent.py (v12-fix-v5)
+修复 network error：将路线规划改为生成器模式，每步 yield 进度消息，
+让 SSE 流在规划期间持续有数据输出，避免 Render 代理因空闲超时断开连接。
+
+关键改动（相比 v4）：
+- 新增 plan_route_with_agent_streaming() 生成器函数
+- 每个步骤完成后 yield ('step', step_info) 进度
+- 最终 yield ('result', result) 返回完整结果
+- 保留 plan_route_with_agent() 作为兼容接口
 """
 import json
 import re
@@ -165,15 +166,22 @@ def _calc_running_duration(distance_m: int, pace_min_per_km: float) -> float:
 
 
 # ============================================================
-# 核心路线规划函数
+# 核心路线规划函数（生成器版本 - 解决 network error）
 # ============================================================
-def plan_route_with_agent(user_query: str, session_id: str,
-                           origin_name: str = None,
-                           origin_lng: float = None,
-                           origin_lat: float = None) -> dict:
-    """使用Agent规划路线，返回完整结果。每个步骤都有超时保护和详细日志。"""
+def plan_route_with_agent_streaming(user_query: str, session_id: str,
+                                     origin_name: str = None,
+                                     origin_lng: float = None,
+                                     origin_lat: float = None):
+    """
+    生成器版本的路线规划函数。
+    每完成一个步骤就 yield 一个 ('step', step_info) 元组，
+    最终 yield ('result', result) 返回完整结果。
+    
+    这样 chat/views.py 可以在每个 yield 点发送 SSE 事件，
+    保持连接活跃，避免 Render 代理因空闲超时断开连接。
+    """
     overall_start = time.time()
-    logger.info(f"[Agent] ========== 开始路线规划 ==========")
+    logger.info(f"[Agent] ========== 开始路线规划(streaming) ==========")
     logger.info(f"[Agent] 用户查询: {user_query}")
     logger.info(f"[Agent] session_id: {session_id}, origin_name: {origin_name}")
 
@@ -196,11 +204,13 @@ def plan_route_with_agent(user_query: str, session_id: str,
     params = parse_user_intent(user_query)
     result['params'] = params
     logger.info(f"[Agent] Step 1 完成 ({time.time()-step_start:.1f}s)")
-    result['agent_steps'].append({
+    step_info = {
         'step': '意图解析',
         'icon': '🧠',
-        'result': f"活动: {params.get('activity_type')}, 时长: {params.get('duration_min')}分钟, 必经点: {params.get('must_pass', [])}"
-    })
+        'result': f"活动: {params.get('activity_type')}, 时长: {params.get('duration_min')}分钟"
+    }
+    result['agent_steps'].append(step_info)
+    yield ('step', step_info)
 
     city = '厦门'
     activity_type = params.get('activity_type', '跑步')
@@ -231,11 +241,13 @@ def plan_route_with_agent(user_query: str, session_id: str,
         start_point = dict(DEFAULT_START)
 
     logger.info(f"[Agent] Step 2 完成 ({time.time()-step_start:.1f}s)")
-    result['agent_steps'].append({
+    step_info = {
         'step': '起点确定',
         'icon': '📍',
         'result': f"{start_point['name']} ({start_point['lng']:.4f}, {start_point['lat']:.4f})"
-    })
+    }
+    result['agent_steps'].append(step_info)
+    yield ('step', step_info)
 
     # Step 3: 知识图谱查询（带超时保护，不阻塞主流程）
     logger.info(f"[Agent] Step 3: 知识图谱查询...")
@@ -246,7 +258,6 @@ def plan_route_with_agent(user_query: str, session_id: str,
         from .models import KGNode
 
         def _do_kg_query():
-            # 不再在请求中初始化知识图谱，避免与 startup.sh 后台初始化竞争
             if KGNode.objects.count() == 0:
                 logger.info("[Agent] KGNode 为空，跳过知识图谱查询")
                 return []
@@ -258,14 +269,18 @@ def plan_route_with_agent(user_query: str, session_id: str,
         result['kg_nodes'] = kg_nodes
         kg_names = ', '.join([n['name'] for n in kg_nodes[:3]]) if kg_nodes else "无"
         logger.info(f"[Agent] Step 3 完成 ({time.time()-step_start:.1f}s): {len(kg_nodes)}个节点")
-        result['agent_steps'].append({
+        step_info = {
             'step': '知识图谱查询',
             'icon': '🕸️',
             'result': f"推荐{len(kg_nodes)}个地点: {kg_names}" if kg_nodes else "跳过（数据未就绪）"
-        })
+        }
+        result['agent_steps'].append(step_info)
+        yield ('step', step_info)
     except Exception as e:
         logger.warning(f"[Agent] Step 3 知识图谱查询失败 ({time.time()-step_start:.1f}s): {e}")
-        result['agent_steps'].append({'step': '知识图谱查询', 'icon': '🕸️', 'result': f'跳过: {str(e)[:50]}'})
+        step_info = {'step': '知识图谱查询', 'icon': '🕸️', 'result': f'跳过: {str(e)[:50]}'}
+        result['agent_steps'].append(step_info)
+        yield ('step', step_info)
 
     # Step 4: RAG知识检索（带超时保护）
     logger.info(f"[Agent] Step 4: RAG知识检索...")
@@ -284,11 +299,13 @@ def plan_route_with_agent(user_query: str, session_id: str,
     result['rag_context'] = rag_context
     result['rag_docs'] = rag_docs
     logger.info(f"[Agent] Step 4 完成 ({time.time()-step_start:.1f}s): {len(rag_docs)}条")
-    result['agent_steps'].append({
+    step_info = {
         'step': 'RAG知识检索',
         'icon': '📚',
         'result': f"检索到{len(rag_docs)}条相关知识"
-    })
+    }
+    result['agent_steps'].append(step_info)
+    yield ('step', step_info)
 
     # Step 5: 构建途经点列表
     logger.info(f"[Agent] Step 5: 构建途经点...")
@@ -313,7 +330,7 @@ def plan_route_with_agent(user_query: str, session_id: str,
                 }
                 logger.info(f"[Agent] 终点 '{destination}' 编码成功: {geo['lng']},{geo['lat']}, 距{dist/1000:.1f}km")
             else:
-                logger.warning(f"[Agent] 终点 '{destination}' 距起点{dist/1000:.1f}km过远")
+                logger.warning(f"[Agent] 终点 '{destination}' 距起点{dist/1000:.1f}km过远，跳过")
         except Exception as e:
             logger.warning(f"[Agent] 终点 '{destination}' 地理编码失败: {e}")
 
@@ -395,11 +412,13 @@ def plan_route_with_agent(user_query: str, session_id: str,
         if elapsed >= 45:
             logger.warning(f"[Agent] 已耗时 {elapsed:.1f}s，跳过 POI 搜索")
 
-    result['agent_steps'].append({
+    step_info = {
         'step': 'POI搜索',
         'icon': '🔍',
         'result': f"找到{len(result.get('pois', []))}个候选地点，必经点{len(must_pass_points)}个"
-    })
+    }
+    result['agent_steps'].append(step_info)
+    yield ('step', step_info)
 
     # 5e: 环形路线回到起点（仅在没有明确终点时）
     if not destination_point:
@@ -407,11 +426,13 @@ def plan_route_with_agent(user_query: str, session_id: str,
 
     result['waypoints'] = waypoints
     logger.info(f"[Agent] Step 5 完成 ({time.time()-step_start:.1f}s): {len(waypoints)}个途经点: {' → '.join([w['name'] for w in waypoints])}")
-    result['agent_steps'].append({
+    step_info = {
         'step': '途经点规划',
         'icon': '🗺️',
         'result': f"规划{len(waypoints)}个途经点: {' → '.join([w['name'] for w in waypoints])}"
-    })
+    }
+    result['agent_steps'].append(step_info)
+    yield ('step', step_info)
 
     # Step 6: 高德路径规划（带超时保护）
     logger.info(f"[Agent] Step 6: 高德路径规划...")
@@ -444,17 +465,20 @@ def plan_route_with_agent(user_query: str, session_id: str,
 
         result['route'] = route_data
         logger.info(f"[Agent] Step 6 完成 ({time.time()-step_start:.1f}s): {actual_dist_km}km, {len(route_data.get('polyline', []))}个坐标点")
-        result['agent_steps'].append({
+        step_info = {
             'step': '路线规划',
             'icon': '🛣️',
-            'result': f"总距离 {actual_dist_km}km，按{activity_type}配速预计 {running_duration_min}分钟，{len(route_data.get('polyline', []))}个坐标点"
-        })
+            'result': f"总距离 {actual_dist_km}km，预计 {running_duration_min}分钟"
+        }
+        result['agent_steps'].append(step_info)
+        yield ('step', step_info)
     except Exception as e:
         logger.error(f"[Agent] Step 6 路线规划失败 ({time.time()-step_start:.1f}s): {e}")
         result['agent_steps'].append({'step': '路线规划', 'icon': '🛣️', 'result': f"规划失败: {str(e)}"})
         result['success'] = False
         result['error'] = str(e)
-        return result
+        yield ('result', result)
+        return
 
     # Step 7: 生成推荐语
     try:
@@ -480,4 +504,21 @@ def plan_route_with_agent(user_query: str, session_id: str,
     result['success'] = True
     total_elapsed = time.time() - overall_start
     logger.info(f"[Agent] ========== 路线规划完成 ({total_elapsed:.1f}s) ==========")
-    return result
+    yield ('result', result)
+
+
+# ============================================================
+# 兼容接口（非生成器版本，供 /api/route/plan/ 使用）
+# ============================================================
+def plan_route_with_agent(user_query: str, session_id: str,
+                           origin_name: str = None,
+                           origin_lng: float = None,
+                           origin_lat: float = None) -> dict:
+    """非生成器版本，兼容旧调用方式"""
+    final_result = None
+    for msg_type, data in plan_route_with_agent_streaming(
+        user_query, session_id, origin_name, origin_lng, origin_lat
+    ):
+        if msg_type == 'result':
+            final_result = data
+    return final_result or {'success': False, 'error': '规划异常'}

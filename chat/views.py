@@ -1,12 +1,10 @@
 """
-chat/views.py (v12-fixed-v3)
-核心修复：
-1. 先 LLM 流式输出文字 → 再路线规划 → 发送路线数据（用户不再等待）
-2. 意图解析只做 1 次，传给 plan_route_with_agent 复用
-3. [PLAN_ROUTE] 标签使用缓冲区机制彻底过滤
-4. 前端 status 消息追加显示，不覆盖已有文字
-5. _memory_store 使用 LRU 淘汰防止内存泄漏
-6. 移除手动 CORS 头（由 django-cors-headers 中间件统一处理）
+chat/views.py (v12-fixed-v4)
+核心修复（相比 v3）：
+- 使用 plan_route_with_agent_streaming 生成器版本
+- 路线规划期间每完成一步就发送 SSE status 事件（心跳）
+- 避免 Render 代理因长时间无数据而断开 SSE 连接（network error）
+- 其他逻辑完全不变
 """
 import json
 import logging
@@ -136,11 +134,12 @@ def _strip_plan_route_tag(text: str) -> str:
 def chat_message(request):
     """POST /api/chat/message/ - SSE流式响应
     
-    核心流程（v3 重构）：
+    核心流程（v4 修复 network error）：
     1. 先让 LLM 流式输出文字描述（用户立即看到内容）
-    2. 文字输出完成后，如果检测到 [PLAN_ROUTE] 标签，再调用路线规划
-    3. 路线规划完成后发送 route_plan 事件
-    4. 最后发送 done 事件
+    2. 文字输出完成后，如果检测到需要路线规划，使用 streaming 版本的 agent
+    3. 路线规划期间每步完成都发送 SSE status 事件（保持连接活跃）
+    4. 路线规划完成后发送 route_plan 事件
+    5. 最后发送 done 事件
     """
     if request.method == 'OPTIONS':
         return _json_response({})
@@ -246,14 +245,14 @@ def chat_message(request):
             should_plan = needs_route_planning(user_msg)
 
         # ============================================================
-        # 阶段2: 路线规划（文字已经输出完毕，用户已看到内容）
+        # 阶段2: 路线规划（使用 streaming 版本，每步发送心跳）
         # ============================================================
         if should_plan:
             yield _sse_event({'type': 'status', 'content': '🗺️ 正在为您规划地图路线...'})
-            logger.info(f"[Chat] 开始路线规划: {user_msg[:50]}")
+            logger.info(f"[Chat] 开始路线规划(streaming): {user_msg[:50]}")
 
             try:
-                from route_planner.agent import plan_route_with_agent
+                from route_planner.agent import plan_route_with_agent_streaming
 
                 # 提取起点名称
                 origin_name = origin if origin else None
@@ -262,23 +261,36 @@ def chat_message(request):
                     if m:
                         origin_name = m.group(1)
 
-                result = plan_route_with_agent(
+                # 使用生成器版本：每步完成都会 yield，我们转发为 SSE 事件
+                for msg_type, data in plan_route_with_agent_streaming(
                     user_query=user_msg,
                     session_id=session_id,
                     origin_name=origin_name,
-                )
+                ):
+                    if msg_type == 'step':
+                        # 每个步骤完成，发送进度消息保持连接活跃
+                        step_icon = data.get('icon', '⏳')
+                        step_name = data.get('step', '')
+                        step_result = data.get('result', '')
+                        yield _sse_event({
+                            'type': 'status',
+                            'content': f'{step_icon} {step_name}: {step_result}'
+                        })
+                        logger.info(f"[Chat] 规划进度: {step_name}")
 
-                if result.get('success'):
-                    route_data = result
-                    rag_docs = result.get('rag_docs', [])
-                    logger.info(f"[Chat] 路线规划成功: {result.get('route', {}).get('total_distance_km')}km")
-                    yield _sse_event({'type': 'route_plan', 'route_data': result})
-                    if rag_docs:
-                        yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
-                else:
-                    error_msg = result.get('error', '路线规划失败')
-                    logger.warning(f"[Chat] 路线规划未成功: {error_msg}")
-                    yield _sse_event({'type': 'status', 'content': f'⚠️ {error_msg}'})
+                    elif msg_type == 'result':
+                        result = data
+                        if result.get('success'):
+                            route_data = result
+                            rag_docs = result.get('rag_docs', [])
+                            logger.info(f"[Chat] 路线规划成功: {result.get('route', {}).get('total_distance_km')}km")
+                            yield _sse_event({'type': 'route_plan', 'route_data': result})
+                            if rag_docs:
+                                yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
+                        else:
+                            error_msg = result.get('error', '路线规划失败')
+                            logger.warning(f"[Chat] 路线规划未成功: {error_msg}")
+                            yield _sse_event({'type': 'status', 'content': f'⚠️ {error_msg}'})
 
             except Exception as e:
                 logger.error(f"[Chat] 路线规划异常: {e}", exc_info=True)
@@ -303,7 +315,7 @@ def chat_message(request):
             if route_data:
                 parsed = route_data.get('params', route_data.get('parsed_params', {}))
             if not parsed:
-                parsed = {'activity_type': '对话', 'duration_min': None, 'preferred_features': []}
+                parsed = {}
             pref.add_query(user_msg, parsed, route_data.get('recommendation', '') if route_data else '')
             logger.info(f"[记忆] session={session_id} 已更新，总计{pref.session_count}次")
         except Exception as e:
