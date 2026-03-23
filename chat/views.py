@@ -1,10 +1,9 @@
 """
-chat/views.py (v12-fixed-v4)
-核心修复（相比 v3）：
-- 使用 plan_route_with_agent_streaming 生成器版本
-- 路线规划期间每完成一步就发送 SSE status 事件（心跳）
-- 避免 Render 代理因长时间无数据而断开 SSE 连接（network error）
-- 其他逻辑完全不变
+chat/views.py (v12-fixed-v5)
+修复：
+- SYSTEM_PROMPT 禁止 AI 给多条路线让用户选，必须直接给出最优路线
+- 移除前端起点输入框依赖，起点从用户消息中自动提取
+- SSE 心跳保持连接活跃避免 network error
 """
 import json
 import logging
@@ -31,10 +30,12 @@ SYSTEM_PROMPT = """你是「路线大师」，专注厦门的运动路线规划A
 支持：跑步、散步、骑行、徒步，考虑健康状况（脚踝/膝盖不适）。
 重要：所有路线只在厦门岛内及周边规划，不会规划需要坐船/渡轮的跨岛路线。
 
-当用户描述运动需求时，请给出简洁的路线建议文字描述，在末尾加 [PLAN_ROUTE] 标记。
-系统会自动调用高德API在地图上绘制真实路线。
-回答简洁、实用，使用中文，适当使用Markdown格式。
-注意：路线时间是按跑步/骑行配速计算的，不是步行时间。"""
+核心规则：
+1. 当用户描述运动需求时，直接给出一条最优路线的简洁文字描述，在末尾加 [PLAN_ROUTE] 标记。
+2. 绝对不要给出多条路线让用户选择！你必须替用户做出最优决策，只推荐一条最合适的路线。
+3. 系统会自动调用高德API在地图上绘制真实路线，你只需要描述路线概要。
+4. 回答简洁、实用，使用中文。
+5. 路线时间是按跑步/骑行配速计算的，不是步行时间。"""
 
 
 def get_client():
@@ -153,7 +154,6 @@ def chat_message(request):
 
     user_msg = body.get('message', '').strip()
     session_id = body.get('session_id', 'default')
-    origin = body.get('origin', '').strip()
 
     if not user_msg:
         return _json_response({'error': '消息不能为空'}, 400)
@@ -254,12 +254,11 @@ def chat_message(request):
             try:
                 from route_planner.agent import plan_route_with_agent_streaming
 
-                # 提取起点名称
-                origin_name = origin if origin else None
-                if not origin_name:
-                    m = re.search(r'从(.{2,12}?)(?:出发|起|跑|到)', user_msg)
-                    if m:
-                        origin_name = m.group(1)
+                # 从用户消息中提取起点名称
+                origin_name = None
+                m = re.search(r'从(.{2,12}?)(?:出发|起|跑|到)', user_msg)
+                if m:
+                    origin_name = m.group(1)
 
                 # 使用生成器版本：每步完成都会 yield，我们转发为 SSE 事件
                 for msg_type, data in plan_route_with_agent_streaming(
