@@ -1,11 +1,11 @@
 """
-chat/views.py (v12-fixed)
+chat/views.py (v12-fixed-v2)
 修复：
-1. 内存泄漏 - _memory_store 增加 LRU 淘汰机制
-2. 移除手动 CORS 头（由 django-cors-headers 中间件统一处理）
-3. save_message_to_db 逻辑优化
-4. parsed_params key名统一
-5. 增加输入长度限制
+1. [PLAN_ROUTE] 标签泄漏 - 使用缓冲区机制彻底过滤
+2. 减少 LLM 调用次数 - 路线已规划时修改 system prompt 禁止输出 [PLAN_ROUTE]
+3. 增加进度反馈 - 路线规划过程中发送 status 事件，避免"卡死"感
+4. 内存泄漏 - _memory_store 增加 LRU 淘汰机制
+5. 移除手动 CORS 头（由 django-cors-headers 中间件统一处理）
 """
 import json
 import logging
@@ -35,6 +35,16 @@ SYSTEM_PROMPT = """你是「路线大师」，专注厦门的运动路线规划A
 当用户描述运动需求时，在回复末尾加 [PLAN_ROUTE]，系统会自动调用高德API生成真实路线地图。
 回答简洁、实用，使用中文，适当使用Markdown格式。
 注意：路线时间是按跑步/骑行配速计算的，不是步行时间。"""
+
+# 当路线已经规划成功时，使用这个 prompt 让 LLM 不再输出 [PLAN_ROUTE]
+SYSTEM_PROMPT_WITH_ROUTE = """你是「路线大师」，专注厦门的运动路线规划AI助手。
+能力：根据用户时间、目标、身体状态规划个性化路线，熟悉厦门所有运动场所。
+支持：跑步、散步、骑行、徒步，考虑健康状况（脚踝/膝盖不适）。
+重要：所有路线只在厦门岛内及周边规划，不会规划需要坐船/渡轮的跨岛路线。
+
+路线已经规划完成并显示在地图上了，请直接用简洁友好的语言总结路线亮点和注意事项。
+不要输出 [PLAN_ROUTE] 标记，不要重复距离和时间数据（地图上已经显示了）。
+回答简洁、实用，使用中文，适当使用Markdown格式。"""
 
 
 def get_client():
@@ -117,6 +127,18 @@ def needs_route_planning(text: str) -> bool:
     return has_activity and has_origin
 
 
+def _sse_event(data: dict) -> str:
+    """生成 SSE 事件字符串"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _strip_plan_route_tag(text: str) -> str:
+    """彻底清除 [PLAN_ROUTE] 标签及其变体"""
+    text = text.replace('[PLAN_ROUTE]', '')
+    text = re.sub(r'\[PLAN[_\s]*ROUTE\]', '', text)
+    return text
+
+
 @csrf_exempt
 def chat_message(request):
     """POST /api/chat/message/ - SSE流式响应"""
@@ -149,29 +171,27 @@ def chat_message(request):
     except Exception as e:
         logger.warning(f"[Chat] 获取用户偏好失败: {e}")
 
-    system_with_memory = SYSTEM_PROMPT
-    if memory_context and '第一次' not in memory_context:
-        system_with_memory += f"\n\n[用户历史偏好] {memory_context}"
-
-    messages_to_send = [{'role': 'system', 'content': system_with_memory}] + history
-
     def stream_gen():
         client = get_client()
         full_response = ''
-        need_plan = False
         route_data = None
         rag_docs = []
 
         direct_plan = needs_route_planning(user_msg) or (origin and any(kw in user_msg for kw in ROUTE_KEYWORDS))
 
         if direct_plan:
+            # 发送进度状态，让前端知道正在规划路线
+            yield _sse_event({'type': 'status', 'content': '正在分析运动需求...'})
+
             try:
                 from route_planner.agent import plan_route_with_agent
                 origin_name = origin if origin else None
                 if not origin_name:
-                    m = re.search(r'从(.{2,12}?)(?:出发|起)', user_msg)
+                    m = re.search(r'从(.{2,12}?)(?:出发|起|跑|到)', user_msg)
                     if m:
                         origin_name = m.group(1)
+
+                yield _sse_event({'type': 'status', 'content': '正在规划路线，调用高德地图API...'})
 
                 result = plan_route_with_agent(
                     user_query=user_msg,
@@ -181,50 +201,98 @@ def chat_message(request):
                 if result.get('success'):
                     route_data = result
                     rag_docs = result.get('rag_docs', [])
-                    yield f"data: {json.dumps({'type': 'route_plan', 'route_data': result}, ensure_ascii=False)}\n\n"
+                    yield _sse_event({'type': 'route_plan', 'route_data': result})
                     if rag_docs:
-                        yield f"data: {json.dumps({'type': 'rag_context', 'docs': rag_docs}, ensure_ascii=False)}\n\n"
-                    route = result.get('route', {})
-                    route_summary = (
-                        f"已完成路线规划：{route.get('total_distance_km')}km，"
-                        f"按{route.get('activity_type', '跑步')}配速预计{route.get('total_duration_min')}分钟，"
-                        f"途经{[w['name'] for w in result.get('waypoints', [])]}，"
-                        f"推荐语：{result.get('recommendation', '')}"
-                    )
-                    messages_to_send.append({'role': 'system', 'content': route_summary})
+                        yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
                 elif result.get('error'):
-                    yield f"data: {json.dumps({'type': 'error', 'error': result['error']}, ensure_ascii=False)}\n\n"
+                    yield _sse_event({'type': 'error', 'error': result['error']})
             except Exception as e:
                 logger.error(f"[Chat] 路线规划失败: {e}")
-                yield f"data: {json.dumps({'type': 'error', 'error': f'路线规划失败: {str(e)}'}, ensure_ascii=False)}\n\n"
+                yield _sse_event({'type': 'error', 'error': f'路线规划失败: {str(e)}'})
+
+        # 根据路线规划结果选择不同的 system prompt
+        if route_data:
+            # 路线已规划成功，使用不含 [PLAN_ROUTE] 指令的 prompt
+            system_prompt = SYSTEM_PROMPT_WITH_ROUTE
+            route = route_data.get('route', {})
+            route_summary = (
+                f"\n\n[路线规划结果] 距离: {route.get('total_distance_km')}km, "
+                f"配速预计: {route.get('total_duration_min')}分钟, "
+                f"活动类型: {route.get('activity_type', '跑步')}, "
+                f"途经: {' → '.join([w['name'] for w in route_data.get('waypoints', [])])}, "
+                f"推荐语: {route_data.get('recommendation', '')}"
+            )
+            system_prompt += route_summary
+        else:
+            system_prompt = SYSTEM_PROMPT
+
+        if memory_context and '第一次' not in memory_context:
+            system_prompt += f"\n\n[用户历史偏好] {memory_context}"
+
+        messages_to_send = [{'role': 'system', 'content': system_prompt}] + history
+
+        # 使用缓冲区机制过滤 [PLAN_ROUTE] 标签
+        # 因为流式输出可能将标签拆分到多个 token 中
+        PLAN_TAG = '[PLAN_ROUTE]'
+        TAG_LEN = len(PLAN_TAG)
+        token_buffer = ''
 
         try:
             stream = client.chat.completions.create(
                 model=settings.DEEPSEEK_MODEL,
                 messages=messages_to_send,
                 temperature=0.7,
-                max_tokens=1000,
+                max_tokens=800,
                 stream=True,
             )
             for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     token = chunk.choices[0].delta.content
                     full_response += token
-                    if '[PLAN_ROUTE]' in full_response:
-                        need_plan = True
-                        token = token.replace('[PLAN_ROUTE]', '')
-                    if token:
-                        yield f"data: {json.dumps({'type': 'token', 'content': token}, ensure_ascii=False)}\n\n"
+                    token_buffer += token
+
+                    # 如果缓冲区中可能包含 [PLAN_ROUTE] 的一部分，继续缓冲
+                    # 只有当缓冲区足够长且不包含标签前缀时，才输出
+                    if PLAN_TAG in token_buffer:
+                        # 找到完整标签，移除它
+                        token_buffer = token_buffer.replace(PLAN_TAG, '')
+                        if token_buffer:
+                            yield _sse_event({'type': 'token', 'content': token_buffer})
+                        token_buffer = ''
+                    elif len(token_buffer) >= TAG_LEN:
+                        # 缓冲区够长了，检查末尾是否是标签的前缀
+                        # 找到最长的可能是 PLAN_TAG 前缀的后缀
+                        safe_len = len(token_buffer)
+                        for k in range(1, TAG_LEN):
+                            if token_buffer.endswith(PLAN_TAG[:k]):
+                                safe_len = len(token_buffer) - k
+                                break
+                        if safe_len > 0:
+                            to_send = token_buffer[:safe_len]
+                            token_buffer = token_buffer[safe_len:]
+                            yield _sse_event({'type': 'token', 'content': to_send})
+
+            # 流结束，输出剩余缓冲区（清除可能的标签残留）
+            if token_buffer:
+                token_buffer = _strip_plan_route_tag(token_buffer)
+                if token_buffer:
+                    yield _sse_event({'type': 'token', 'content': token_buffer})
+
         except Exception as e:
             logger.error(f"[Chat] DeepSeek失败: {e}")
-            fallback = route_data.get('recommendation', '路线规划完成，请查看地图。') if route_data else f'抱歉，AI响应失败：{str(e)}'
+            if route_data:
+                fallback = route_data.get('recommendation', '路线规划完成，请查看地图上的路线。')
+            else:
+                fallback = f'抱歉，AI响应暂时不可用，请稍后重试。'
             full_response = fallback
-            yield f"data: {json.dumps({'type': 'token', 'content': fallback}, ensure_ascii=False)}\n\n"
+            yield _sse_event({'type': 'token', 'content': fallback})
 
-        clean_response = full_response.replace('[PLAN_ROUTE]', '').strip()
+        clean_response = _strip_plan_route_tag(full_response).strip()
 
-        if need_plan and not route_data:
+        # 如果 LLM 输出了 [PLAN_ROUTE] 但之前没有成功规划路线，尝试延迟规划
+        if '[PLAN_ROUTE]' in full_response and not route_data:
             try:
+                yield _sse_event({'type': 'status', 'content': '正在规划路线...'})
                 from route_planner.agent import plan_route_with_agent, parse_user_intent
                 params = parse_user_intent(user_msg)
                 origin_name = origin or params.get('origin')
@@ -232,9 +300,9 @@ def chat_message(request):
                 if result.get('success'):
                     route_data = result
                     rag_docs = result.get('rag_docs', [])
-                    yield f"data: {json.dumps({'type': 'route_plan', 'route_data': result}, ensure_ascii=False)}\n\n"
+                    yield _sse_event({'type': 'route_plan', 'route_data': result})
                     if rag_docs:
-                        yield f"data: {json.dumps({'type': 'rag_context', 'docs': rag_docs}, ensure_ascii=False)}\n\n"
+                        yield _sse_event({'type': 'rag_context', 'docs': rag_docs})
             except Exception as e:
                 logger.error(f"[Chat] 延迟路线规划失败: {e}")
 
@@ -245,7 +313,7 @@ def chat_message(request):
             extra['rag_docs'] = rag_docs
         add_msg(session_id, 'assistant', clean_response, extra)
 
-        # 更新用户偏好（统一使用 'params' 键）
+        # 更新用户偏好
         try:
             pref, _ = UserPreference.objects.get_or_create(session_id=session_id)
             parsed = {}
@@ -258,7 +326,7 @@ def chat_message(request):
         except Exception as e:
             logger.error(f"[记忆] 更新失败: {e}")
 
-        yield f"data: {json.dumps({'type': 'done', 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        yield _sse_event({'type': 'done', 'session_id': session_id})
 
     resp = StreamingHttpResponse(stream_gen(), content_type='text/event-stream; charset=utf-8')
     resp['Cache-Control'] = 'no-cache'

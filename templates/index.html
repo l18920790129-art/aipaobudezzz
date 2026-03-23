@@ -684,6 +684,9 @@ createApp({
       });
 
       try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 180000); // 3分钟超时
+
         const resp = await fetch(`${API_BASE}/api/chat/message/`, {
           method:'POST',
           headers:{'Content-Type':'application/json'},
@@ -692,9 +695,11 @@ createApp({
             session_id: currentSessionId.value,
             origin: originInput.value.trim(),
           }),
+          signal: controller.signal,
         });
         if (!resp.ok) {
           messages.value[aiIdx].content = `❌ 请求失败 (${resp.status})，请重试`;
+          clearTimeout(timeoutId);
           return;
         }
 
@@ -715,9 +720,16 @@ createApp({
               const ev = JSON.parse(js);
               isTyping.value = false;
               if (ev.type === 'token') {
-                messages.value[aiIdx].content += ev.content;
-                scrollBottom();
+                // 过滤 [PLAN_ROUTE] 标签残留
+                let tokenContent = ev.content;
+                tokenContent = tokenContent.replace(/\[PLAN_ROUTE\]/g, '');
+                tokenContent = tokenContent.replace(/\[PLAN_?ROUTE?\]?/g, '');
+                if (tokenContent) {
+                  messages.value[aiIdx].content += tokenContent;
+                  scrollBottom();
+                }
               } else if (ev.type === 'route_plan') {
+                console.log('[路线大师] 收到路线数据:', JSON.stringify(ev.route_data?.route?.polyline?.length || 0), '个坐标点');
                 messages.value[aiIdx].routeData = ev.route_data;
                 messages.value[aiIdx].agentSteps = ev.route_data.agent_steps || [];
                 messages.value[aiIdx].ragDocs = ev.route_data.rag_docs || [];
@@ -725,15 +737,39 @@ createApp({
                 scrollBottom();
               } else if (ev.type === 'rag_context') {
                 messages.value[aiIdx].ragDocs = ev.docs || [];
+              } else if (ev.type === 'status') {
+                // 显示进度状态（如"正在规划路线..."）
+                messages.value[aiIdx].content = `⏳ ${ev.content}`;
+                scrollBottom();
               } else if (ev.type === 'error') {
                 messages.value[aiIdx].content += `\n\n❌ ${ev.error}`;
               }
-            } catch {}
+            } catch(parseErr) {
+              console.warn('[路线大师] SSE解析错误:', parseErr, line);
+            }
           }
         }
+        clearTimeout(timeoutId);
+
+        // 最终清理：移除可能残留的 [PLAN_ROUTE] 和状态前缀
+        let finalContent = messages.value[aiIdx].content;
+        finalContent = finalContent.replace(/\[PLAN_ROUTE\]/g, '').replace(/\[PLAN_?ROUTE?\]?/g, '');
+        // 如果内容以状态提示开头且后面有实际内容，移除状态提示
+        if (finalContent.startsWith('⏳') && finalContent.includes('\n')) {
+          finalContent = finalContent.replace(/^⏳[^\n]*\n?/, '');
+        } else if (finalContent.startsWith('⏳') && messages.value[aiIdx].routeData) {
+          // 路线已规划但只有状态文字，替换为默认提示
+          finalContent = '路线已规划完成，请查看地图和下方路线卡片 👇';
+        }
+        messages.value[aiIdx].content = finalContent.trim();
+
       } catch(e) {
         isTyping.value = false;
-        messages.value[aiIdx].content = `❌ 网络错误：${e.message}`;
+        if (e.name === 'AbortError') {
+          messages.value[aiIdx].content = `⏰ 请求超时，服务器可能正在启动中（Render免费实例需要30-60秒唤醒），请稍后重试`;
+        } else {
+          messages.value[aiIdx].content = `❌ 网络错误：${e.message}`;
+        }
       } finally {
         isSending.value = false;
         isTyping.value = false;
@@ -746,22 +782,39 @@ createApp({
 
     // ===== 地图路线展示 =====
     function showRoute(routeData) {
-      if (!amapInstance) return;
+      if (!amapInstance) { console.error('[路线大师] 地图实例未初始化'); return; }
       clearRoute();
       currentRoute.value = routeData;
 
       const polyline = routeData?.route?.polyline || [];
+      console.log(`[路线大师] showRoute: ${polyline.length} 个坐标点, ${(routeData.waypoints||[]).length} 个途经点`);
+
       if (polyline.length > 0) {
-        const path = polyline.map(p => new AMap.LngLat(p[0], p[1]));
-        routePolyline = new AMap.Polyline({
-          path, strokeColor:'#2563eb', strokeWeight:5,
-          strokeOpacity:.9, lineJoin:'round', lineCap:'round',
-        });
-        amapInstance.add(routePolyline);
+        const path = polyline.map(p => {
+          // 兼容 [lng, lat] 数组格式和 {lng, lat} 对象格式
+          if (Array.isArray(p)) return new AMap.LngLat(p[0], p[1]);
+          if (p.lng !== undefined) return new AMap.LngLat(p.lng, p.lat);
+          return null;
+        }).filter(Boolean);
+
+        if (path.length > 0) {
+          routePolyline = new AMap.Polyline({
+            path, strokeColor:'#2563eb', strokeWeight:5,
+            strokeOpacity:.9, lineJoin:'round', lineCap:'round',
+            showDir: true,  // 显示方向箭头
+          });
+          amapInstance.add(routePolyline);
+          console.log(`[路线大师] 路线绑制成功: ${path.length} 个有效点`);
+        } else {
+          console.warn('[路线大师] 路线坐标解析后为空');
+        }
+      } else {
+        console.warn('[路线大师] 无 polyline 数据');
       }
 
-      (routeData.waypoints||[]).forEach((wp, idx) => {
-        const isS = idx===0, isE = idx===routeData.waypoints.length-1;
+      const waypoints = routeData.waypoints || routeData.route?.waypoints || [];
+      waypoints.forEach((wp, idx) => {
+        const isS = idx===0, isE = idx===waypoints.length-1;
         const color = isS?'#10b981':isE?'#ef4444':'#2563eb';
         const label = isS?'起':isE?'终':String(idx);
         const marker = new AMap.Marker({
@@ -773,7 +826,10 @@ createApp({
         routeMarkers.push(marker);
       });
 
-      if (polyline.length > 0) amapInstance.setFitView([routePolyline, ...routeMarkers]);
+      // 自适应视图
+      const fitItems = [...routeMarkers];
+      if (routePolyline) fitItems.unshift(routePolyline);
+      if (fitItems.length > 0) amapInstance.setFitView(fitItems, false, [50, 50, 50, 50]);
     }
 
     function clearRoute() {
@@ -847,6 +903,8 @@ createApp({
     // ===== 工具函数 =====
     function renderMd(content) {
       if (!content) return '';
+      // 清理 [PLAN_ROUTE] 标签
+      content = content.replace(/\[PLAN_ROUTE\]/g, '').replace(/\[PLAN_?ROUTE?\]?/g, '');
       try { return marked.parse(content); } catch { return content.replace(/\n/g,'<br>'); }
     }
 
