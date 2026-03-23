@@ -1,13 +1,15 @@
 """
-amap_service.py (v12-fixed)
-修复：
+amap_service.py (v12-fix-v4)
+修复地图不画线 Bug：
 1. 使用 requests.Session 连接池（减少TCP握手开销）
 2. 增加请求重试机制
-3. 统一超时配置
-4. 保留渡轮过滤和直线降级禁止逻辑
+3. 降低单次超时到 10 秒（原 15 秒太长）
+4. build_multi_segment_route 增加每段详细日志
+5. 保留渡轮过滤和直线降级禁止逻辑
 """
 import math
 import logging
+import time
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -17,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 AMAP_KEY = settings.AMAP_WEB_KEY
 AMAP_BASE = 'https://restapi.amap.com'
-AMAP_TIMEOUT = 15
+AMAP_TIMEOUT = 10  # 降低到 10 秒，避免单段卡太久
 
 FERRY_KEYWORDS = ['轮渡', '渡轮', '渡口', '轮船', '坐船', '乘船', '摆渡', 'ferry']
 
@@ -31,8 +33,8 @@ def _get_session():
     if _session is None:
         _session = requests.Session()
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=0.5,
+            total=2,
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=5, pool_maxsize=10)
@@ -102,7 +104,7 @@ def geocode(address: str, city: str = '厦门') -> dict:
         resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德地理编码] 查询: {address}, 状态: {data.get('status')}")
+        logger.info(f"[高德地理编码] 查询: {address}, 状态: {data.get('status')}, info: {data.get('info')}")
         if data.get('status') == '1' and data.get('geocodes'):
             geo = data['geocodes'][0]
             location = geo.get('location', '')
@@ -215,12 +217,15 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
         'destination': f"{dest_lng},{dest_lat}",
         'output': 'JSON',
     }
+    start_time = time.time()
     try:
         session = _get_session()
+        logger.info(f"[高德步行规划] 请求: {origin_lng},{origin_lat} -> {dest_lng},{dest_lat}")
         resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[高德步行规划] {origin_lng},{origin_lat} -> {dest_lng},{dest_lat}, 状态: {data.get('status')}")
+        elapsed = time.time() - start_time
+        logger.info(f"[高德步行规划] 响应 ({elapsed:.1f}s): 状态={data.get('status')}, info={data.get('info')}")
 
         if data.get('status') != '1':
             raise ValueError(f"步行路径规划失败: {data.get('info', '未知错误')}")
@@ -253,6 +258,7 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
                 'action': step.get('action', ''),
             })
 
+        logger.info(f"[高德步行规划] 成功: {len(all_points)}个坐标点, 距离{path.get('distance')}m")
         return {
             'distance': int(path.get('distance', 0)),
             'duration': int(path.get('duration', 0)),
@@ -260,7 +266,8 @@ def plan_walking_route(origin_lng: float, origin_lat: float,
             'polyline': all_points,
         }
     except requests.RequestException as e:
-        logger.error(f"[高德步行规划] 网络错误: {e}")
+        elapsed = time.time() - start_time
+        logger.error(f"[高德步行规划] 网络错误 ({elapsed:.1f}s): {e}")
         raise
 
 
@@ -273,11 +280,16 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
         'destination': f"{dest_lng},{dest_lat}",
         'output': 'JSON',
     }
+    start_time = time.time()
     try:
         session = _get_session()
+        logger.info(f"[高德骑行规划] 请求: {origin_lng},{origin_lat} -> {dest_lng},{dest_lat}")
         resp = session.get(url, params=params, timeout=AMAP_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
+        elapsed = time.time() - start_time
+        logger.info(f"[高德骑行规划] 响应 ({elapsed:.1f}s)")
+
         if data.get('errcode') != 0 and data.get('status') != '1':
             raise ValueError(f"骑行路径规划失败: {data.get('errmsg', data.get('info', '未知错误'))}")
         route = data.get('data', data.get('route', {}))
@@ -300,7 +312,9 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
                 'distance': int(step.get('distance', 0)),
                 'duration': int(step.get('duration', 0)),
                 'road': step.get('road', ''),
+                'action': step.get('action', ''),
             })
+
         return {
             'distance': int(path.get('distance', 0)),
             'duration': int(path.get('duration', 0)),
@@ -308,15 +322,17 @@ def plan_cycling_route(origin_lng: float, origin_lat: float,
             'polyline': all_points,
         }
     except requests.RequestException as e:
-        logger.error(f"[高德骑行规划] 网络错误: {e}")
+        elapsed = time.time() - start_time
+        logger.error(f"[高德骑行规划] 网络错误 ({elapsed:.1f}s): {e}")
         raise
 
 
 def build_multi_segment_route(waypoints: list, activity_type: str = '步行') -> dict:
-    """多段路线规划，禁止直线降级连接"""
+    """多段路线规划，禁止直线降级连接，每段有详细日志"""
     if len(waypoints) < 2:
         raise ValueError("至少需要2个途经点")
 
+    logger.info(f"[多段路线] 开始规划: {len(waypoints)}个途经点, 活动类型={activity_type}")
     all_polyline = []
     total_distance = 0
     total_duration = 0
@@ -326,6 +342,9 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
     for i in range(len(waypoints) - 1):
         origin = waypoints[i]
         dest = waypoints[i + 1]
+        seg_start = time.time()
+
+        logger.info(f"[多段路线] 第{i+1}/{len(waypoints)-1}段: {origin['name']} -> {dest['name']}")
 
         straight_dist = _haversine_distance(
             origin['lng'], origin['lat'],
@@ -363,10 +382,12 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
                 'duration': seg['duration'],
                 'steps': seg['steps'][:3],
             })
-            logger.info(f"[多段路线] 第{i+1}段成功: {origin['name']} -> {dest['name']}, {seg['distance']}m")
+            seg_elapsed = time.time() - seg_start
+            logger.info(f"[多段路线] 第{i+1}段成功 ({seg_elapsed:.1f}s): {origin['name']} -> {dest['name']}, {seg['distance']}m, {len(seg['polyline'])}个坐标点")
 
         except Exception as e:
-            logger.warning(f"[多段路线] 第{i+1}段跳过({e}): {origin['name']} -> {dest['name']}")
+            seg_elapsed = time.time() - seg_start
+            logger.warning(f"[多段路线] 第{i+1}段失败 ({seg_elapsed:.1f}s): {origin['name']} -> {dest['name']}, 原因: {e}")
             failed_segments.append({
                 'from': origin['name'],
                 'to': dest['name'],
@@ -377,6 +398,7 @@ def build_multi_segment_route(waypoints: list, activity_type: str = '步行') ->
         reasons = '; '.join([f['reason'] for f in failed_segments])
         raise ValueError(f"所有路段规划均失败，请重新选择途经点。原因：{reasons}")
 
+    logger.info(f"[多段路线] 规划完成: 成功{len(segment_details)}段, 失败{len(failed_segments)}段, 总距离{total_distance}m, {len(all_polyline)}个坐标点")
     return {
         'total_distance_m': total_distance,
         'total_duration_s': total_duration,
